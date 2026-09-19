@@ -803,7 +803,7 @@ function BusyBlockForm({ editing, setEditing, setBusySlots, notify }) {
 
   return (
     <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
-      <p className="mb-3 text-sm font-medium" style={{ color: INK }}>{id ? "Sửa khung giờ bận" : "Khung giờ bận mới"} — {DAYS[day].full}</p>
+      <p className="mb-3 text-sm font-medium" style={{ color: INK }}>{editing.isDraft ? "Khung giờ bận mới" : "Sửa khung giờ bận"} — {DAYS[day].full}</p>
       <div className="flex flex-wrap items-end gap-2">
         <div>
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Bắt đầu</label>
