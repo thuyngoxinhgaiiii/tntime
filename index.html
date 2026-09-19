@@ -238,7 +238,7 @@ function clampRange(a, b) {
 
 function normalizeIntervals(list) {
   const sorted = (list || [])
-    .map(([s, e]) => [Number(s), Number(e)])
+    .map((item) => (Array.isArray(item) ? [Number(item[0]), Number(item[1])] : [Number(item.s), Number(item.e)]))
     .filter(([s, e]) => e > s)
     .sort((a, b) => a[0] - b[0]);
   const out = [];
@@ -340,6 +340,18 @@ function normalizeLoadedFreeSlots(raw) {
   if (looksOld) return migrateOldFreeSlots(raw);
   const out = {};
   Object.keys(raw).forEach((d) => { out[d] = normalizeIntervals(raw[d] || []); });
+  return out;
+}
+
+/* Firestore không cho phép lưu "mảng lồng mảng" (mảng chứa mảng con) trực
+   tiếp, nên trước khi lưu, chuyển mỗi khoảng [bắtĐầu, kếtThúc] thành object
+   { s, e }. Khi đọc lên, normalizeIntervals ở trên đã tự nhận diện được cả
+   hai dạng (mảng hoặc object) nên không cần chuyển ngược lại thủ công. */
+function serializeFreeSlots(freeSlots) {
+  const out = {};
+  Object.keys(freeSlots || {}).forEach((d) => {
+    out[d] = (freeSlots[d] || []).map(([s, e]) => ({ s, e }));
+  });
   return out;
 }
 
@@ -1040,7 +1052,7 @@ function App() {
         setTasks(data.tasks || []);
         // Nếu dữ liệu cũ (theo giờ) vừa được chuyển sang định dạng theo phút,
         // lưu lại luôn để lần sau không phải chuyển đổi lại.
-        if (looksOld) ref.set({ freeSlots: migratedFree }, { merge: true }).catch(() => {});
+        if (looksOld) ref.set({ freeSlots: serializeFreeSlots(migratedFree) }, { merge: true }).catch(() => {});
       } else {
         const rawInitFree = loadLS(LS_FREE, null);
         const initFree = rawInitFree ? normalizeLoadedFreeSlots(rawInitFree) : seedDefaultFreeSlots();
@@ -1049,7 +1061,7 @@ function App() {
         setFreeSlots(initFree);
         setTasks(initTasks);
         ref.set({
-          freeSlots: initFree,
+          freeSlots: serializeFreeSlots(initFree),
           tasks: initTasks,
           email: user.email || null,
           updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
@@ -1072,7 +1084,7 @@ function App() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       db.collection("users").doc(user.uid).set({
-        freeSlots, tasks,
+        freeSlots: serializeFreeSlots(freeSlots), tasks,
         email: user.email || null,
         updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       }, { merge: true }).then(() => {
