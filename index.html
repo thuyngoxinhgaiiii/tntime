@@ -172,6 +172,12 @@ const HOUR_START = 6;
 const HOUR_END = 22;
 const HOURS = Array.from({ length: HOUR_END - HOUR_START + 1 }, (_, i) => HOUR_START + i);
 
+/* Khung thời gian trong ngày tính theo phút (dùng cho khung giờ rảnh chính
+   xác tới từng phút). Ngày bắt đầu 6:00, kết thúc 23:00. */
+const DAY_START_MIN = HOUR_START * 60; // 360  = 6:00
+const DAY_END_MIN = (HOUR_END + 1) * 60; // 1380 = 23:00
+const TIME_STEP_MIN = 5;
+
 const CATEGORIES = [
   { id: "hoc", label: "Học trên lớp", bg: "#FDEAF2", border: "#F2699B", text: "#B23D6F" },
   { id: "btvn", label: "Bài tập", bg: "#FFF6DE", border: "#FFC94D", text: "#9C7A12" },
@@ -211,11 +217,130 @@ function loadLS(k, fallback) {
   }
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Khung giờ rảnh — lưu theo khoảng phút (chính xác tới từng 5 phút)      */
+/*  Cấu trúc: freeSlots = { [ngày]: [[phútBắtĐầu, phútKếtThúc], ...] }     */
+/*  Ví dụ freeSlots[2] = [[600, 720]] nghĩa là Thứ 4 rảnh từ 10:00-12:00.  */
+/* ---------------------------------------------------------------------- */
+
 function seedDefaultFreeSlots() {
   const seed = {};
-  [1, 2, 3, 4].forEach((day) => { for (let h = 19; h <= 21; h++) seed[key(day, h)] = true; });
-  [5, 6].forEach((day) => { for (let h = 9; h <= 16; h++) seed[key(day, h)] = true; });
+  [1, 2, 3, 4].forEach((day) => { seed[day] = [[19 * 60, 22 * 60]]; }); // 19:00 - 22:00
+  [5, 6].forEach((day) => { seed[day] = [[9 * 60, 17 * 60]]; }); // 9:00 - 17:00
   return seed;
+}
+
+function clampRange(a, b) {
+  const s = Math.max(DAY_START_MIN, Math.min(a, b));
+  const e = Math.min(DAY_END_MIN, Math.max(a, b));
+  return [s, e];
+}
+
+function normalizeIntervals(list) {
+  const sorted = (list || [])
+    .map(([s, e]) => [Number(s), Number(e)])
+    .filter(([s, e]) => e > s)
+    .sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const [s, e] of sorted) {
+    if (out.length && s <= out[out.length - 1][1]) {
+      out[out.length - 1][1] = Math.max(out[out.length - 1][1], e);
+    } else {
+      out.push([s, e]);
+    }
+  }
+  return out;
+}
+
+function addFreeRange(freeSlots, day, start, end) {
+  const [s, e] = clampRange(start, end);
+  if (e <= s) return freeSlots;
+  const dayList = freeSlots[day] || [];
+  return { ...freeSlots, [day]: normalizeIntervals([...dayList, [s, e]]) };
+}
+
+function removeFreeRange(freeSlots, day, start, end) {
+  const [s, e] = clampRange(start, end);
+  if (e <= s) return freeSlots;
+  const dayList = freeSlots[day] || [];
+  const out = [];
+  for (const [ds, de] of dayList) {
+    if (de <= s || ds >= e) { out.push([ds, de]); continue; }
+    if (ds < s) out.push([ds, s]);
+    if (de > e) out.push([e, de]);
+  }
+  return { ...freeSlots, [day]: normalizeIntervals(out) };
+}
+
+function isRangeFree(freeSlots, day, start, end) {
+  const dayList = freeSlots[day] || [];
+  return dayList.some(([ds, de]) => ds <= start && de >= end);
+}
+
+function freeSegmentsInRange(freeSlots, day, start, end) {
+  const dayList = freeSlots[day] || [];
+  const segs = [];
+  dayList.forEach(([ds, de]) => {
+    const os = Math.max(ds, start), oe = Math.min(de, end);
+    if (oe > os) segs.push([os, oe]);
+  });
+  return segs;
+}
+
+function freeMinutesForDay(freeSlots, day) {
+  return (freeSlots[day] || []).reduce((s, [a, b]) => s + (b - a), 0);
+}
+
+function totalFreeMinutes(freeSlots) {
+  return Object.keys(freeSlots).reduce((s, d) => s + freeMinutesForDay(freeSlots, d), 0);
+}
+
+function formatDuration(min) {
+  const h = Math.floor(min / 60), m = Math.round(min % 60);
+  if (!h) return `${m}p`;
+  return m ? `${h}h${String(m).padStart(2, "0")}` : `${h}h`;
+}
+
+function minToHHMM(min) {
+  const m = Math.max(0, Math.round(min));
+  const h = Math.floor(m / 60), mm = m % 60;
+  return `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
+function hhmmToMin(str) {
+  const [h, m] = String(str || "0:0").split(":").map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
+function roundToStep(min) {
+  return Math.round(min / TIME_STEP_MIN) * TIME_STEP_MIN;
+}
+
+/* Chuyển dữ liệu khung giờ rảnh định dạng cũ (mỗi ô 1 giờ, dạng
+   { "ngày-giờ": true }) sang định dạng mới theo khoảng phút, để không mất
+   dữ liệu của người dùng đã dùng app từ trước. */
+function migrateOldFreeSlots(old) {
+  const byDay = {};
+  Object.keys(old).forEach((k) => {
+    if (old[k] !== true) return;
+    const parts = k.split("-");
+    const day = Number(parts[0]), hour = Number(parts[1]);
+    if (Number.isNaN(day) || Number.isNaN(hour)) return;
+    byDay[day] = byDay[day] || [];
+    byDay[day].push([hour * 60, hour * 60 + 60]);
+  });
+  const result = {};
+  Object.keys(byDay).forEach((d) => { result[d] = normalizeIntervals(byDay[d]); });
+  return result;
+}
+
+function normalizeLoadedFreeSlots(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const looksOld = Object.keys(raw).some((k) => k.includes("-"));
+  if (looksOld) return migrateOldFreeSlots(raw);
+  const out = {};
+  Object.keys(raw).forEach((d) => { out[d] = normalizeIntervals(raw[d] || []); });
+  return out;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -223,11 +348,10 @@ function seedDefaultFreeSlots() {
 /* ---------------------------------------------------------------------- */
 
 function canPlace(freeSlots, occupied, day, start, duration, excludeId) {
+  if (start + duration > HOUR_END + 1) return false;
+  if (!isRangeFree(freeSlots, day, start * 60, (start + duration) * 60)) return false;
   for (let i = 0; i < duration; i++) {
-    const h = start + i;
-    if (h > HOUR_END) return false;
-    const k = key(day, h);
-    if (!freeSlots[k]) return false;
+    const k = key(day, start + i);
     if (occupied[k] && occupied[k] !== excludeId) return false;
   }
   return true;
@@ -318,7 +442,7 @@ function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTa
 
   return (
     <div className="overflow-x-auto">
-      <div className="grid select-none" style={{ gridTemplateColumns: `${labelW}px repeat(7, minmax(64px, 1fr))`, gridTemplateRows: `32px repeat(${HOURS.length}, ${rowH}px)`, minWidth: 640 }}>
+      <div className="grid select-none" style={{ gridTemplateColumns: `${labelW}px repeat(7, minmax(64px, 1fr))`, gridTemplateRows: `32px repeat(${HOURS.length}, ${rowH}px) 16px`, minWidth: 640 }}>
         <div style={{ gridColumn: 1, gridRow: 1 }} />
         {DAYS.map((d, di) => (
           <div key={d.short} className="flex items-end justify-center pb-1 text-xs font-semibold" style={{ gridColumn: di + 2, gridRow: 1, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
@@ -326,10 +450,12 @@ function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTa
         {HOURS.map((h, hi) => (
           <div key={"lbl-" + h} className="flex items-start justify-end pr-2 text-[11px]" style={{ gridColumn: 1, gridRow: hi + 2, color: MUTED_LIGHT, transform: "translateY(-6px)" }}>{h}:00</div>
         ))}
+        <div className="flex items-start justify-end pr-2 text-[11px]" style={{ gridColumn: 1, gridRow: HOURS.length + 2, color: MUTED_LIGHT, transform: "translateY(-6px)" }}>{HOUR_END + 1}:00</div>
         {DAYS.map((d, di) =>
           HOURS.map((h, hi) => {
             const k = key(di, h);
-            const isFree = !!freeSlots[k];
+            const startMin = h * 60, endMin = (h + 1) * 60;
+            const segs = freeSegmentsInRange(freeSlots, di, startMin, endMin);
             const isOver = dragOverKey === k;
             return (
               <div
@@ -340,16 +466,30 @@ function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTa
                 onDragLeave={mode === "display" ? () => setDragOverKey((prev) => (prev === k ? null : prev)) : undefined}
                 onDrop={mode === "display" ? (e) => { e.preventDefault(); setDragOverKey(null); onDropTask(di, h); } : undefined}
                 style={{
+                  position: "relative",
                   gridColumn: di + 2, gridRow: hi + 2,
-                  backgroundColor: isFree ? (isOver ? "#FBD9E7" : "#FEF1F6") : "#FFFCFD",
+                  backgroundColor: "#FFFCFD",
                   borderTop: "1px solid #FBEAF1",
                   borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7",
                   borderRight: "1px solid #FDF3F7",
                   cursor: mode === "paint" ? "pointer" : "default",
                   outline: isOver ? "2px dashed " + SECONDARY : "none",
                   outlineOffset: "-2px",
+                  overflow: "hidden",
                 }}
-              />
+              >
+                {segs.map(([os, oe], si) => (
+                  <div
+                    key={si}
+                    style={{
+                      position: "absolute", left: 0, right: 0,
+                      top: `${((os - startMin) / 60) * 100}%`,
+                      height: `${((oe - os) / 60) * 100}%`,
+                      backgroundColor: isOver ? "#FBD9E7" : "#FEF1F6",
+                    }}
+                  />
+                ))}
+              </div>
             );
           })
         )}
@@ -385,14 +525,14 @@ function DashboardView({ freeSlots, tasks, onDropTask }) {
   const [selectedTaskId, setSelectedTaskId] = useState(null);
   const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
 
-  const totalFree = Object.values(freeSlots).filter(Boolean).length;
+  const totalFreeMin = totalFreeMinutes(freeSlots);
   const scheduled = tasks.filter((t) => t.status === "scheduled");
   const scheduledHours = scheduled.reduce((s, t) => s + t.duration, 0);
   const unscheduledCount = tasks.filter((t) => t.status === "unscheduled").length;
-  const utilization = totalFree ? Math.round((scheduledHours / totalFree) * 100) : 0;
+  const utilization = totalFreeMin ? Math.round(((scheduledHours * 60) / totalFreeMin) * 100) : 0;
 
   const perDay = DAYS.map((d, di) => {
-    const free = HOURS.filter((h) => freeSlots[key(di, h)]).length;
+    const free = freeMinutesForDay(freeSlots, di) / 60;
     const busy = scheduled.filter((t) => t.scheduledDay === di).reduce((s, t) => s + t.duration, 0);
     return { ...d, free, busy };
   });
@@ -401,7 +541,7 @@ function DashboardView({ freeSlots, tasks, onDropTask }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard icon={Clock3} label="Giờ rảnh / tuần" value={`${totalFree}h`} accent={PRIMARY} />
+        <StatCard icon={Clock3} label="Giờ rảnh / tuần" value={formatDuration(totalFreeMin)} accent={PRIMARY} />
         <StatCard icon={CalendarClock} label="Đã sắp xếp" value={`${scheduledHours}h`} sub={`${scheduled.length} việc`} accent={SECONDARY} />
         <StatCard icon={LayoutGrid} label="Tỷ lệ sử dụng" value={`${utilization}%`} accent={PURPLE} />
         <StatCard icon={AlertTriangle} label="Chưa sắp xếp được" value={unscheduledCount} sub={unscheduledCount ? "cần điều chỉnh" : "ổn"} accent={DANGER} />
@@ -417,7 +557,7 @@ function DashboardView({ freeSlots, tasks, onDropTask }) {
                 <div className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${(d.free / maxHours) * 100}%`, backgroundColor: "#FBD9E7" }} />
                 <div className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${(d.busy / maxHours) * 100}%`, backgroundColor: SECONDARY }} />
               </div>
-              <span className="w-16 text-right text-[11px]" style={{ color: MUTED_LIGHT }}>{d.busy}h / {d.free}h</span>
+              <span className="w-20 text-right text-[11px]" style={{ color: MUTED_LIGHT }}>{d.busy}h / {formatDuration(d.free * 60)}</span>
             </div>
           ))}
         </div>
@@ -442,7 +582,7 @@ function DashboardView({ freeSlots, tasks, onDropTask }) {
 /*  View: Slot editor                                                     */
 /* ---------------------------------------------------------------------- */
 
-function SlotEditorView({ freeSlots, setFreeSlots }) {
+function SlotEditorView({ freeSlots, setFreeSlots, notify }) {
   const paintMode = useRef(null);
 
   useEffect(() => {
@@ -452,21 +592,18 @@ function SlotEditorView({ freeSlots, setFreeSlots }) {
   }, []);
 
   const applyCell = (day, hour, mode) => {
-    setFreeSlots((prev) => {
-      const next = { ...prev };
-      const k = key(day, hour);
-      if (mode === "add") next[k] = true; else delete next[k];
-      return next;
-    });
+    const startMin = hour * 60, endMin = hour * 60 + 60;
+    setFreeSlots((prev) => (mode === "add" ? addFreeRange(prev, day, startMin, endMin) : removeFreeRange(prev, day, startMin, endMin)));
   };
   const handleStart = (day, hour) => {
-    const mode = freeSlots[key(day, hour)] ? "remove" : "add";
+    const fullyFree = isRangeFree(freeSlots, day, hour * 60, hour * 60 + 60);
+    const mode = fullyFree ? "remove" : "add";
     paintMode.current = mode;
     applyCell(day, hour, mode);
   };
   const handleEnter = (day, hour) => { if (paintMode.current) applyCell(day, hour, paintMode.current); };
 
-  const totalFree = Object.values(freeSlots).filter(Boolean).length;
+  const totalFreeMin = totalFreeMinutes(freeSlots);
 
   return (
     <div className="space-y-4">
@@ -474,13 +611,93 @@ function SlotEditorView({ freeSlots, setFreeSlots }) {
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
             <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ rảnh</p>
-            <p className="text-xs" style={{ color: MUTED }}>Nhấn giữ và kéo qua nhiều ô để chọn nhanh · {totalFree}h rảnh / tuần</p>
+            <p className="text-xs" style={{ color: MUTED }}>Nhấn giữ và kéo qua nhiều ô để chọn nhanh theo giờ · {formatDuration(totalFreeMin)} rảnh / tuần</p>
           </div>
           <button onClick={() => setFreeSlots({})} className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
             <RotateCcw size={13} /> Xoá tất cả
           </button>
         </div>
         <WeekGrid mode="paint" freeSlots={freeSlots} tasks={[]} onPaintStart={handleStart} onPaintEnter={handleEnter} />
+      </div>
+
+      <PreciseTimeEditor freeSlots={freeSlots} setFreeSlots={setFreeSlots} notify={notify} />
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Chỉnh khung giờ rảnh/bận chính xác tới từng phút (bước 5 phút)         */
+/* ---------------------------------------------------------------------- */
+
+function PreciseTimeEditor({ freeSlots, setFreeSlots, notify }) {
+  const [day, setDay] = useState(0);
+  const [start, setStart] = useState("08:00");
+  const [end, setEnd] = useState("09:00");
+  const [action, setAction] = useState("free"); // "free" | "busy"
+
+  const apply = () => {
+    const s = roundToStep(hhmmToMin(start));
+    const e = roundToStep(hhmmToMin(end));
+    if (e <= s) { notify("Giờ kết thúc phải sau giờ bắt đầu.", "error"); return; }
+    if (s < DAY_START_MIN || e > DAY_END_MIN) {
+      notify(`Chỉ có thể chọn trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`, "error");
+      return;
+    }
+    setFreeSlots((prev) => (action === "free" ? addFreeRange(prev, day, s, e) : removeFreeRange(prev, day, s, e)));
+    notify(action === "free" ? `Đã thêm khung rảnh ${minToHHMM(s)} – ${minToHHMM(e)}.` : `Đã đánh dấu bận ${minToHHMM(s)} – ${minToHHMM(e)}.`, "success");
+  };
+
+  const dayIntervals = freeSlots[day] || [];
+
+  const removeInterval = (idx) => {
+    setFreeSlots((prev) => {
+      const list = (prev[day] || []).slice();
+      list.splice(idx, 1);
+      return { ...prev, [day]: list };
+    });
+  };
+
+  return (
+    <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <p className="mb-1 text-sm font-medium" style={{ color: INK }}>Chỉnh chính xác đến từng phút</p>
+      <p className="mb-3 text-xs" style={{ color: MUTED }}>VD: bận từ 10:35 đến 12:00 — chọn ngày, nhập giờ, chọn "Đánh dấu bận" rồi bấm Áp dụng. Có thể chọn lẻ tới 5 phút.</p>
+
+      <div className="flex flex-wrap items-end gap-2">
+        <div>
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Ngày</label>
+          <select value={day} onChange={(e) => setDay(Number(e.target.value))} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
+            {DAYS.map((d, i) => <option key={d.short} value={i}>{d.full}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Bắt đầu</label>
+          <input type="time" step={TIME_STEP_MIN * 60} value={start} onChange={(e) => setStart(e.target.value)} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Kết thúc</label>
+          <input type="time" step={TIME_STEP_MIN * 60} value={end} onChange={(e) => setEnd(e.target.value)} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
+        </div>
+        <div className="flex gap-1 rounded-full border p-1" style={{ borderColor: BORDER }}>
+          <button type="button" onClick={() => setAction("free")} className="rounded-full px-3 py-1.5 text-xs font-semibold transition-colors" style={{ backgroundColor: action === "free" ? PRIMARY : "transparent", color: action === "free" ? "#FFFFFF" : "#8A6070" }}>Đánh dấu rảnh</button>
+          <button type="button" onClick={() => setAction("busy")} className="rounded-full px-3 py-1.5 text-xs font-semibold transition-colors" style={{ backgroundColor: action === "busy" ? DANGER : "transparent", color: action === "busy" ? "#FFFFFF" : "#8A6070" }}>Đánh dấu bận</button>
+        </div>
+        <button onClick={apply} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-semibold text-white" style={{ backgroundColor: SECONDARY, color: "#5A4405", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
+          <CheckCircle2 size={14} /> Áp dụng
+        </button>
+      </div>
+
+      <div className="mt-4">
+        <p className="mb-2 text-xs" style={{ color: MUTED }}>Khung giờ rảnh của {DAYS[day].full}{dayIntervals.length === 0 ? " — chưa có khung nào." : ":"}</p>
+        {dayIntervals.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {dayIntervals.map(([s, e], idx) => (
+              <span key={idx} className="flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs" style={{ borderColor: BORDER, color: INK, backgroundColor: "#FFF6FA" }}>
+                {minToHHMM(s)} – {minToHHMM(e)}
+                <button onClick={() => removeInterval(idx)} style={{ color: MUTED_LIGHT }}><XIcon size={11} /></button>
+              </span>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -815,11 +1032,18 @@ function App() {
       if (cancelled) return;
       if (snap.exists) {
         const data = snap.data() || {};
+        const rawFree = data.freeSlots || {};
+        const looksOld = Object.keys(rawFree).some((k) => k.includes("-"));
+        const migratedFree = normalizeLoadedFreeSlots(rawFree);
         skipNextSave.current = true;
-        setFreeSlots(data.freeSlots || {});
+        setFreeSlots(migratedFree);
         setTasks(data.tasks || []);
+        // Nếu dữ liệu cũ (theo giờ) vừa được chuyển sang định dạng theo phút,
+        // lưu lại luôn để lần sau không phải chuyển đổi lại.
+        if (looksOld) ref.set({ freeSlots: migratedFree }, { merge: true }).catch(() => {});
       } else {
-        const initFree = loadLS(LS_FREE, null) || seedDefaultFreeSlots();
+        const rawInitFree = loadLS(LS_FREE, null);
+        const initFree = rawInitFree ? normalizeLoadedFreeSlots(rawInitFree) : seedDefaultFreeSlots();
         const initTasks = loadLS(LS_TASKS, null) || [];
         skipNextSave.current = true;
         setFreeSlots(initFree);
@@ -938,7 +1162,7 @@ function App() {
 
       <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
         {view === "dashboard" && <DashboardView freeSlots={freeSlots} tasks={tasks} onDropTask={handleDropTask} />}
-        {view === "slots" && <SlotEditorView freeSlots={freeSlots} setFreeSlots={setFreeSlots} />}
+        {view === "slots" && <SlotEditorView freeSlots={freeSlots} setFreeSlots={setFreeSlots} notify={notify} />}
         {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} freeSlots={freeSlots} notify={notify} />}
       </main>
 
