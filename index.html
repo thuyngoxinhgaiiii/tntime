@@ -362,12 +362,15 @@ function normalizeLoadedFreeIntervals(raw) {
 }
 
 /* Dữ liệu cũ lưu "khung giờ RẢNH" — chuyển sang mô hình "khung giờ BẬN" mới
-   bằng cách lấy phần bù (không rảnh = bận), áp dụng cho cả 7 ngày kể cả
-   ngày không có dữ liệu cũ (giữ đúng hành vi trước đây: không đánh dấu rảnh
-   thì không dùng để xếp lịch được). */
+   bằng cách lấy phần bù (không rảnh = bận) cho những ngày TRƯỚC ĐÂY đã có
+   đánh dấu rảnh cụ thể. Ngày nào chưa từng đánh dấu gì trong dữ liệu cũ (kể
+   cả trường hợp đã bấm "Xoá tất cả" nên rỗng) thì coi là chưa có thông tin
+   và mặc định là RẢNH ở mô hình mới, thay vì suy ra cả ngày bận. */
 function migrateFreeToBusySlots(freeIntervalsByDay) {
   const result = {};
   DAYS.forEach((_d, di) => {
+    const hasOldData = Object.prototype.hasOwnProperty.call(freeIntervalsByDay || {}, di) || Object.prototype.hasOwnProperty.call(freeIntervalsByDay || {}, String(di));
+    if (!hasOldData) { result[di] = []; return; }
     const freeList = freeIntervalsByDay[di] || [];
     const busyRanges = complementIntervals(freeList, DAY_START_MIN, DAY_END_MIN);
     result[di] = busyRanges.map(([s, e]) => ({ id: uid(), s, e, note: "" }));
