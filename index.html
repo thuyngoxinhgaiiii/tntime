@@ -218,17 +218,10 @@ function loadLS(k, fallback) {
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Khung giờ rảnh — lưu theo khoảng phút (chính xác tới từng 5 phút)      */
-/*  Cấu trúc: freeSlots = { [ngày]: [[phútBắtĐầu, phútKếtThúc], ...] }     */
-/*  Ví dụ freeSlots[2] = [[600, 720]] nghĩa là Thứ 4 rảnh từ 10:00-12:00.  */
+/*  Khung giờ bận — lưu theo từng khối có ghi chú (chính xác tới 5 phút)   */
+/*  Cấu trúc: busySlots = { [ngày]: [{ id, s, e, note }, ...] }            */
+/*  Bất kỳ khung giờ nào KHÔNG được đánh dấu bận thì mặc định là RẢNH.     */
 /* ---------------------------------------------------------------------- */
-
-function seedDefaultFreeSlots() {
-  const seed = {};
-  [1, 2, 3, 4].forEach((day) => { seed[day] = [[19 * 60, 22 * 60]]; }); // 19:00 - 22:00
-  [5, 6].forEach((day) => { seed[day] = [[9 * 60, 17 * 60]]; }); // 9:00 - 17:00
-  return seed;
-}
 
 function clampRange(a, b) {
   const s = Math.max(DAY_START_MIN, Math.min(a, b));
@@ -252,47 +245,72 @@ function normalizeIntervals(list) {
   return out;
 }
 
-function addFreeRange(freeSlots, day, start, end) {
-  const [s, e] = clampRange(start, end);
-  if (e <= s) return freeSlots;
-  const dayList = freeSlots[day] || [];
-  return { ...freeSlots, [day]: normalizeIntervals([...dayList, [s, e]]) };
-}
-
-function removeFreeRange(freeSlots, day, start, end) {
-  const [s, e] = clampRange(start, end);
-  if (e <= s) return freeSlots;
-  const dayList = freeSlots[day] || [];
+/* Phần còn trống sau khi trừ đi các khoảng đã cho, trong giới hạn [dayStart, dayEnd]. */
+function complementIntervals(list, dayStart, dayEnd) {
+  const merged = normalizeIntervals(list);
   const out = [];
-  for (const [ds, de] of dayList) {
-    if (de <= s || ds >= e) { out.push([ds, de]); continue; }
-    if (ds < s) out.push([ds, s]);
-    if (de > e) out.push([e, de]);
-  }
-  return { ...freeSlots, [day]: normalizeIntervals(out) };
+  let cursor = dayStart;
+  merged.forEach(([s, e]) => {
+    if (s > cursor) out.push([cursor, Math.min(s, dayEnd)]);
+    cursor = Math.max(cursor, e);
+  });
+  if (cursor < dayEnd) out.push([cursor, dayEnd]);
+  return out.filter(([s, e]) => e > s);
 }
 
-function isRangeFree(freeSlots, day, start, end) {
-  const dayList = freeSlots[day] || [];
-  return dayList.some(([ds, de]) => ds <= start && de >= end);
+function addBusyBlock(busySlots, day, start, end, note) {
+  const [s, e] = clampRange(start, end);
+  if (e <= s) return busySlots;
+  const dayList = busySlots[day] || [];
+  const block = { id: uid(), s, e, note: (note || "").trim() };
+  return { ...busySlots, [day]: [...dayList, block] };
 }
 
-function freeSegmentsInRange(freeSlots, day, start, end) {
-  const dayList = freeSlots[day] || [];
+function updateBusyBlock(busySlots, day, id, patch) {
+  const dayList = busySlots[day] || [];
+  return { ...busySlots, [day]: dayList.map((b) => (b.id === id ? { ...b, ...patch } : b)) };
+}
+
+function removeBusyBlock(busySlots, day, id) {
+  const dayList = busySlots[day] || [];
+  return { ...busySlots, [day]: dayList.filter((b) => b.id !== id) };
+}
+
+function isRangeFreeOfBusy(busySlots, day, start, end, excludeId) {
+  const dayList = busySlots[day] || [];
+  return !dayList.some((b) => b.id !== excludeId && b.s < end && b.e > start);
+}
+
+function busySegmentsInRange(busySlots, day, start, end) {
+  const dayList = busySlots[day] || [];
   const segs = [];
-  dayList.forEach(([ds, de]) => {
-    const os = Math.max(ds, start), oe = Math.min(de, end);
-    if (oe > os) segs.push([os, oe]);
+  dayList.forEach((b) => {
+    const os = Math.max(b.s, start), oe = Math.min(b.e, end);
+    if (oe > os) segs.push({ ...b, os, oe });
   });
   return segs;
 }
 
-function freeMinutesForDay(freeSlots, day) {
-  return (freeSlots[day] || []).reduce((s, [a, b]) => s + (b - a), 0);
+function dayBusyUnion(busySlots, day) {
+  return normalizeIntervals(busySlots[day] || []);
 }
 
-function totalFreeMinutes(freeSlots) {
-  return Object.keys(freeSlots).reduce((s, d) => s + freeMinutesForDay(freeSlots, d), 0);
+function busyMinutesForDay(busySlots, day) {
+  return dayBusyUnion(busySlots, day).reduce((s, [a, b]) => s + (b - a), 0);
+}
+
+function totalBusyMinutes(busySlots) {
+  return Object.keys(busySlots || {}).reduce((s, d) => s + busyMinutesForDay(busySlots, d), 0);
+}
+
+const DAY_TOTAL_MIN = DAY_END_MIN - DAY_START_MIN;
+
+function freeMinutesForDay(busySlots, day) {
+  return Math.max(0, DAY_TOTAL_MIN - busyMinutesForDay(busySlots, day));
+}
+
+function totalFreeMinutes(busySlots) {
+  return DAYS.reduce((s, _d, di) => s + freeMinutesForDay(busySlots, di), 0);
 }
 
 function formatDuration(min) {
@@ -316,9 +334,9 @@ function roundToStep(min) {
   return Math.round(min / TIME_STEP_MIN) * TIME_STEP_MIN;
 }
 
-/* Chuyển dữ liệu khung giờ rảnh định dạng cũ (mỗi ô 1 giờ, dạng
-   { "ngày-giờ": true }) sang định dạng mới theo khoảng phút, để không mất
-   dữ liệu của người dùng đã dùng app từ trước. */
+/* Chuyển dữ liệu "khung giờ rảnh" định dạng cũ nhất (mỗi ô 1 giờ, dạng
+   { "ngày-giờ": true }) sang khoảng phút — bước trung gian trước khi suy ra
+   khung giờ bận mới. */
 function migrateOldFreeSlots(old) {
   const byDay = {};
   Object.keys(old).forEach((k) => {
@@ -334,7 +352,7 @@ function migrateOldFreeSlots(old) {
   return result;
 }
 
-function normalizeLoadedFreeSlots(raw) {
+function normalizeLoadedFreeIntervals(raw) {
   if (!raw || typeof raw !== "object") return {};
   const looksOld = Object.keys(raw).some((k) => k.includes("-"));
   if (looksOld) return migrateOldFreeSlots(raw);
@@ -343,14 +361,29 @@ function normalizeLoadedFreeSlots(raw) {
   return out;
 }
 
-/* Firestore không cho phép lưu "mảng lồng mảng" (mảng chứa mảng con) trực
-   tiếp, nên trước khi lưu, chuyển mỗi khoảng [bắtĐầu, kếtThúc] thành object
-   { s, e }. Khi đọc lên, normalizeIntervals ở trên đã tự nhận diện được cả
-   hai dạng (mảng hoặc object) nên không cần chuyển ngược lại thủ công. */
-function serializeFreeSlots(freeSlots) {
+/* Dữ liệu cũ lưu "khung giờ RẢNH" — chuyển sang mô hình "khung giờ BẬN" mới
+   bằng cách lấy phần bù (không rảnh = bận), áp dụng cho cả 7 ngày kể cả
+   ngày không có dữ liệu cũ (giữ đúng hành vi trước đây: không đánh dấu rảnh
+   thì không dùng để xếp lịch được). */
+function migrateFreeToBusySlots(freeIntervalsByDay) {
+  const result = {};
+  DAYS.forEach((_d, di) => {
+    const freeList = freeIntervalsByDay[di] || [];
+    const busyRanges = complementIntervals(freeList, DAY_START_MIN, DAY_END_MIN);
+    result[di] = busyRanges.map(([s, e]) => ({ id: uid(), s, e, note: "" }));
+  });
+  return result;
+}
+
+/* Chuẩn hoá dữ liệu busySlots đọc từ Firestore: đảm bảo mỗi khối có đủ
+   id/s/e/note hợp lệ, bỏ khối rỗng hoặc sai lệch. */
+function normalizeLoadedBusySlots(raw) {
+  if (!raw || typeof raw !== "object") return {};
   const out = {};
-  Object.keys(freeSlots || {}).forEach((d) => {
-    out[d] = (freeSlots[d] || []).map(([s, e]) => ({ s, e }));
+  Object.keys(raw).forEach((d) => {
+    out[d] = (raw[d] || [])
+      .map((b) => ({ id: b.id || uid(), s: Number(b.s), e: Number(b.e), note: typeof b.note === "string" ? b.note : "" }))
+      .filter((b) => b.e > b.s);
   });
   return out;
 }
@@ -359,9 +392,9 @@ function serializeFreeSlots(freeSlots) {
 /*  Scheduling helpers                                                    */
 /* ---------------------------------------------------------------------- */
 
-function canPlace(freeSlots, occupied, day, start, duration, excludeId) {
+function canPlace(busySlots, occupied, day, start, duration, excludeId) {
   if (start + duration > HOUR_END + 1) return false;
-  if (!isRangeFree(freeSlots, day, start * 60, (start + duration) * 60)) return false;
+  if (!isRangeFreeOfBusy(busySlots, day, start * 60, (start + duration) * 60)) return false;
   for (let i = 0; i < duration; i++) {
     const k = key(day, start + i);
     if (occupied[k] && occupied[k] !== excludeId) return false;
@@ -379,7 +412,7 @@ function buildOccupied(tasks, excludeId) {
   return occ;
 }
 
-function autoSchedule(tasks, freeSlots) {
+function autoSchedule(tasks, busySlots) {
   const occupied = buildOccupied(tasks, null);
   const pending = tasks
     .filter((t) => t.status !== "scheduled")
@@ -399,7 +432,7 @@ function autoSchedule(tasks, freeSlots) {
         ? Math.min(HOUR_END - t.duration + 1, t.deadlineHour - t.duration)
         : HOUR_END - t.duration + 1;
       for (let h = HOUR_START; h <= upperBound; h++) {
-        if (canPlace(freeSlots, occupied, day, h, t.duration, null)) {
+        if (canPlace(busySlots, occupied, day, h, t.duration, null)) {
           for (let i = 0; i < t.duration; i++) occupied[key(day, h + i)] = t.id;
           results[t.id] = { scheduledDay: day, scheduledStart: h, status: "scheduled" };
           placed = true;
@@ -447,7 +480,7 @@ function Toast({ toast, onClose }) {
 /*  Week grid — shared between Slot Editor & Dashboard                    */
 /* ---------------------------------------------------------------------- */
 
-function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTask, selectedTaskId, onSelectTask }) {
+function WeekGrid({ busySlots, tasks, onDropTask, selectedTaskId, onSelectTask }) {
   const rowH = 34;
   const labelW = 54;
   const [dragOverKey, setDragOverKey] = useState(null);
@@ -467,16 +500,14 @@ function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTa
           HOURS.map((h, hi) => {
             const k = key(di, h);
             const startMin = h * 60, endMin = (h + 1) * 60;
-            const segs = freeSegmentsInRange(freeSlots, di, startMin, endMin);
+            const segs = busySegmentsInRange(busySlots, di, startMin, endMin);
             const isOver = dragOverKey === k;
             return (
               <div
                 key={k}
-                onMouseDown={mode === "paint" ? () => onPaintStart(di, h) : undefined}
-                onMouseEnter={mode === "paint" ? () => onPaintEnter(di, h) : undefined}
-                onDragOver={mode === "display" ? (e) => { e.preventDefault(); setDragOverKey(k); } : undefined}
-                onDragLeave={mode === "display" ? () => setDragOverKey((prev) => (prev === k ? null : prev)) : undefined}
-                onDrop={mode === "display" ? (e) => { e.preventDefault(); setDragOverKey(null); onDropTask(di, h); } : undefined}
+                onDragOver={(e) => { e.preventDefault(); setDragOverKey(k); }}
+                onDragLeave={() => setDragOverKey((prev) => (prev === k ? null : prev))}
+                onDrop={(e) => { e.preventDefault(); setDragOverKey(null); onDropTask(di, h); }}
                 style={{
                   position: "relative",
                   gridColumn: di + 2, gridRow: hi + 2,
@@ -484,20 +515,20 @@ function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTa
                   borderTop: "1px solid #FBEAF1",
                   borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7",
                   borderRight: "1px solid #FDF3F7",
-                  cursor: mode === "paint" ? "pointer" : "default",
                   outline: isOver ? "2px dashed " + SECONDARY : "none",
                   outlineOffset: "-2px",
                   overflow: "hidden",
                 }}
               >
-                {segs.map(([os, oe], si) => (
+                {segs.map((seg, si) => (
                   <div
                     key={si}
+                    title={seg.note || "Bận"}
                     style={{
                       position: "absolute", left: 0, right: 0,
-                      top: `${((os - startMin) / 60) * 100}%`,
-                      height: `${((oe - os) / 60) * 100}%`,
-                      backgroundColor: isOver ? "#FBD9E7" : "#FEF1F6",
+                      top: `${((seg.os - startMin) / 60) * 100}%`,
+                      height: `${((seg.oe - seg.os) / 60) * 100}%`,
+                      backgroundColor: isOver ? "#F3C9D6" : "#F3DDE5",
                     }}
                   />
                 ))}
@@ -505,25 +536,124 @@ function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTa
             );
           })
         )}
-        {mode === "display" &&
-          tasks.filter((t) => t.status === "scheduled").map((t) => {
-            const c = catOf(t.category);
-            const selected = selectedTaskId === t.id;
-            return (
-              <div
-                key={t.id}
-                draggable
-                onDragStart={(e) => e.dataTransfer.setData("text/plain", t.id)}
-                onClick={() => onSelectTask(t.id)}
-                title={`${t.name} · ${t.duration}h`}
-                className="z-10 mx-0.5 my-0.5 flex cursor-grab items-center gap-1 overflow-hidden rounded-xl border px-1.5 text-[11px] font-medium leading-tight active:cursor-grabbing"
-                style={{ gridColumn: t.scheduledDay + 2, gridRow: `${HOURS.indexOf(t.scheduledStart) + 2} / span ${t.duration}`, backgroundColor: c.bg, borderColor: selected ? c.text : c.border, borderWidth: selected ? 2 : 1, color: c.text, boxShadow: selected ? "0 0 0 2px " + c.bg : "none" }}
-              >
-                <GripVertical size={11} className="shrink-0 opacity-50" />
-                <span className="truncate">{t.name}</span>
-              </div>
-            );
-          })}
+        {tasks.filter((t) => t.status === "scheduled").map((t) => {
+          const c = catOf(t.category);
+          const selected = selectedTaskId === t.id;
+          return (
+            <div
+              key={t.id}
+              draggable
+              onDragStart={(e) => e.dataTransfer.setData("text/plain", t.id)}
+              onClick={() => onSelectTask(t.id)}
+              title={`${t.name} · ${t.duration}h`}
+              className="z-10 mx-0.5 my-0.5 flex cursor-grab items-center gap-1 overflow-hidden rounded-xl border px-1.5 text-[11px] font-medium leading-tight active:cursor-grabbing"
+              style={{ gridColumn: t.scheduledDay + 2, gridRow: `${HOURS.indexOf(t.scheduledStart) + 2} / span ${t.duration}`, backgroundColor: c.bg, borderColor: selected ? c.text : c.border, borderWidth: selected ? 2 : 1, color: c.text, boxShadow: selected ? "0 0 0 2px " + c.bg : "none" }}
+            >
+              <GripVertical size={11} className="shrink-0 opacity-50" />
+              <span className="truncate">{t.name}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Lịch chỉnh khung giờ bận — kéo chuột trực tiếp, chính xác tới 5 phút   */
+/* ---------------------------------------------------------------------- */
+
+function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock }) {
+  const rowH = 34;
+  const labelW = 54;
+  const pxPerMin = rowH / 60;
+  const totalHeight = HOURS.length * rowH;
+  const dragRef = useRef(null); // { day, startMin, top }
+  const [draft, setDraft] = useState(null); // { day, s, e }
+
+  const minuteAtY = (y) => {
+    const raw = DAY_START_MIN + y / pxPerMin;
+    return Math.min(DAY_END_MIN, Math.max(DAY_START_MIN, roundToStep(raw)));
+  };
+
+  const handleMouseDown = (day) => (e) => {
+    if (e.target !== e.currentTarget) return; // bấm vào khối đã có, để onClick của khối đó xử lý
+    const rect = e.currentTarget.getBoundingClientRect();
+    const m = minuteAtY(e.clientY - rect.top);
+    dragRef.current = { day, startMin: m, top: rect.top };
+    setDraft({ day, s: m, e: m });
+  };
+
+  useEffect(() => {
+    const handleMove = (e) => {
+      if (!dragRef.current) return;
+      const { day, startMin, top } = dragRef.current;
+      const m = minuteAtY(e.clientY - top);
+      setDraft({ day, s: Math.min(startMin, m), e: Math.max(startMin, m) });
+    };
+    const handleUp = () => {
+      if (!dragRef.current) return;
+      dragRef.current = null;
+      setDraft((d) => {
+        if (d && d.e - d.s >= TIME_STEP_MIN) onCreateDraft(d.day, d.s, d.e);
+        return null;
+      });
+    };
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [onCreateDraft]);
+
+  return (
+    <div className="overflow-x-auto">
+      <div className="flex select-none" style={{ minWidth: 640 }}>
+        <div style={{ width: labelW, flexShrink: 0 }}>
+          <div style={{ height: 24 }} />
+          <div style={{ position: "relative", height: totalHeight }}>
+            {HOURS.map((h) => (
+              <div key={h} style={{ position: "absolute", top: (h - HOUR_START) * rowH - 6, right: 6, fontSize: 11, color: MUTED_LIGHT }}>{h}:00</div>
+            ))}
+            <div style={{ position: "absolute", top: totalHeight - 6, right: 6, fontSize: 11, color: MUTED_LIGHT }}>{HOUR_END + 1}:00</div>
+          </div>
+        </div>
+        {DAYS.map((d, di) => (
+          <div key={d.short} style={{ flex: 1, minWidth: 64 }}>
+            <div className="flex items-end justify-center pb-1 text-xs font-semibold" style={{ height: 24, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
+            <div
+              onMouseDown={handleMouseDown(di)}
+              style={{
+                position: "relative", height: totalHeight, cursor: "crosshair",
+                backgroundColor: "#FFFCFD",
+                backgroundImage: `repeating-linear-gradient(to bottom, #FBEAF1 0, #FBEAF1 1px, transparent 1px, transparent ${rowH}px)`,
+                borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7",
+                borderRight: "1px solid #FDF3F7",
+              }}
+            >
+              {(busySlots[di] || []).map((b) => (
+                <div
+                  key={b.id}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); onSelectBlock(di, b); }}
+                  title={b.note || "Bận"}
+                  className="absolute left-0.5 right-0.5 cursor-pointer overflow-hidden rounded-md border px-1.5 py-0.5 text-[10.5px] leading-tight hover:brightness-95"
+                  style={{ top: (b.s - DAY_START_MIN) * pxPerMin, height: Math.max(8, (b.e - b.s) * pxPerMin), backgroundColor: "#FBD9E7", borderColor: DANGER, color: "#7A3348" }}
+                >
+                  <span className="font-semibold">{minToHHMM(b.s)}–{minToHHMM(b.e)}</span>
+                  {b.note && <div className="truncate opacity-80">{b.note}</div>}
+                </div>
+              ))}
+              {draft && draft.day === di && (
+                <div
+                  className="absolute left-0.5 right-0.5 rounded-md border-2 border-dashed"
+                  style={{ top: (draft.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (draft.e - draft.s) * pxPerMin), borderColor: PRIMARY, backgroundColor: "#FDE3EE99" }}
+                />
+              )}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -533,18 +663,18 @@ function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTa
 /*  View: Dashboard                                                       */
 /* ---------------------------------------------------------------------- */
 
-function DashboardView({ freeSlots, tasks, onDropTask }) {
+function DashboardView({ busySlots, tasks, onDropTask }) {
   const [selectedTaskId, setSelectedTaskId] = useState(null);
   const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
 
-  const totalFreeMin = totalFreeMinutes(freeSlots);
+  const totalFreeMin = totalFreeMinutes(busySlots);
   const scheduled = tasks.filter((t) => t.status === "scheduled");
   const scheduledHours = scheduled.reduce((s, t) => s + t.duration, 0);
   const unscheduledCount = tasks.filter((t) => t.status === "unscheduled").length;
   const utilization = totalFreeMin ? Math.round(((scheduledHours * 60) / totalFreeMin) * 100) : 0;
 
   const perDay = DAYS.map((d, di) => {
-    const free = freeMinutesForDay(freeSlots, di) / 60;
+    const free = freeMinutesForDay(busySlots, di) / 60;
     const busy = scheduled.filter((t) => t.scheduledDay === di).reduce((s, t) => s + t.duration, 0);
     return { ...d, free, busy };
   });
@@ -584,7 +714,7 @@ function DashboardView({ freeSlots, tasks, onDropTask }) {
           <p className="text-sm font-medium" style={{ color: INK }}>Lịch tuần — kéo khối việc để đổi giờ</p>
           {selectedTask && <span className="text-xs" style={{ color: MUTED }}>Đang chọn: <b style={{ color: catOf(selectedTask.category).text }}>{selectedTask.name}</b></span>}
         </div>
-        <WeekGrid mode="display" freeSlots={freeSlots} tasks={tasks} onDropTask={(day, hour) => onDropTask(selectedTaskId, day, hour)} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} />
+        <WeekGrid busySlots={busySlots} tasks={tasks} onDropTask={(day, hour) => onDropTask(selectedTaskId, day, hour)} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} />
       </div>
     </div>
   );
@@ -594,122 +724,99 @@ function DashboardView({ freeSlots, tasks, onDropTask }) {
 /*  View: Slot editor                                                     */
 /* ---------------------------------------------------------------------- */
 
-function SlotEditorView({ freeSlots, setFreeSlots, notify }) {
-  const paintMode = useRef(null);
-
-  useEffect(() => {
-    const up = () => (paintMode.current = null);
-    window.addEventListener("mouseup", up);
-    return () => window.removeEventListener("mouseup", up);
-  }, []);
-
-  const applyCell = (day, hour, mode) => {
-    const startMin = hour * 60, endMin = hour * 60 + 60;
-    setFreeSlots((prev) => (mode === "add" ? addFreeRange(prev, day, startMin, endMin) : removeFreeRange(prev, day, startMin, endMin)));
-  };
-  const handleStart = (day, hour) => {
-    const fullyFree = isRangeFree(freeSlots, day, hour * 60, hour * 60 + 60);
-    const mode = fullyFree ? "remove" : "add";
-    paintMode.current = mode;
-    applyCell(day, hour, mode);
-  };
-  const handleEnter = (day, hour) => { if (paintMode.current) applyCell(day, hour, paintMode.current); };
-
-  const totalFreeMin = totalFreeMinutes(freeSlots);
+function SlotEditorView({ busySlots, setBusySlots, notify }) {
+  const [editing, setEditing] = useState(null); // { day, id, s, e, note }
+  const totalFreeMin = totalFreeMinutes(busySlots);
 
   return (
     <div className="space-y-4">
       <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
-            <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ rảnh</p>
-            <p className="text-xs" style={{ color: MUTED }}>Nhấn giữ và kéo qua nhiều ô để chọn nhanh theo giờ · {formatDuration(totalFreeMin)} rảnh / tuần</p>
+            <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ bận</p>
+            <p className="text-xs" style={{ color: MUTED }}>Kéo chuột trên lịch để chọn chính xác tới 5 phút · khung giờ chưa đánh dấu mặc định là rảnh · {formatDuration(totalFreeMin)} rảnh / tuần</p>
           </div>
-          <button onClick={() => setFreeSlots({})} className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
+          <button onClick={() => { setBusySlots({}); setEditing(null); }} className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
             <RotateCcw size={13} /> Xoá tất cả
           </button>
         </div>
-        <WeekGrid mode="paint" freeSlots={freeSlots} tasks={[]} onPaintStart={handleStart} onPaintEnter={handleEnter} />
+        <BusyEditorGrid
+          busySlots={busySlots}
+          onCreateDraft={(day, s, e) => setEditing({ day, id: null, s, e, note: "" })}
+          onSelectBlock={(day, block) => setEditing({ day, id: block.id, s: block.s, e: block.e, note: block.note || "" })}
+        />
       </div>
 
-      <PreciseTimeEditor freeSlots={freeSlots} setFreeSlots={setFreeSlots} notify={notify} />
+      <BusyBlockForm editing={editing} setEditing={setEditing} setBusySlots={setBusySlots} notify={notify} />
     </div>
   );
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Chỉnh khung giờ rảnh/bận chính xác tới từng phút (bước 5 phút)         */
+/*  Form thêm/sửa 1 khối "khung giờ bận" — có ghi chú đang bận việc gì     */
 /* ---------------------------------------------------------------------- */
 
-function PreciseTimeEditor({ freeSlots, setFreeSlots, notify }) {
-  const [day, setDay] = useState(0);
-  const [start, setStart] = useState("08:00");
-  const [end, setEnd] = useState("09:00");
-  const [action, setAction] = useState("free"); // "free" | "busy"
+function BusyBlockForm({ editing, setEditing, setBusySlots, notify }) {
+  if (!editing) {
+    return (
+      <div className="rounded-2xl border border-dashed p-4 text-center text-xs" style={{ borderColor: BORDER, color: MUTED }}>
+        Kéo chuột trên lịch phía trên để đánh dấu khung giờ bận (chính xác tới 5 phút), hoặc bấm vào một khung đã đánh dấu để sửa / xoá.
+      </div>
+    );
+  }
 
-  const apply = () => {
-    const s = roundToStep(hhmmToMin(start));
-    const e = roundToStep(hhmmToMin(end));
-    if (e <= s) { notify("Giờ kết thúc phải sau giờ bắt đầu.", "error"); return; }
-    if (s < DAY_START_MIN || e > DAY_END_MIN) {
+  const { day, id, s, e, note } = editing;
+  const setField = (patch) => setEditing((prev) => ({ ...prev, ...patch }));
+
+  const save = () => {
+    if (editing.e <= editing.s) { notify("Giờ kết thúc phải sau giờ bắt đầu.", "error"); return; }
+    if (editing.s < DAY_START_MIN || editing.e > DAY_END_MIN) {
       notify(`Chỉ có thể chọn trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`, "error");
       return;
     }
-    setFreeSlots((prev) => (action === "free" ? addFreeRange(prev, day, s, e) : removeFreeRange(prev, day, s, e)));
-    notify(action === "free" ? `Đã thêm khung rảnh ${minToHHMM(s)} – ${minToHHMM(e)}.` : `Đã đánh dấu bận ${minToHHMM(s)} – ${minToHHMM(e)}.`, "success");
+    if (id) {
+      setBusySlots((prev) => updateBusyBlock(prev, day, id, { s: editing.s, e: editing.e, note: editing.note.trim() }));
+      notify("Đã cập nhật khung giờ bận.", "success");
+    } else {
+      setBusySlots((prev) => addBusyBlock(prev, day, editing.s, editing.e, editing.note));
+      notify(`Đã đánh dấu bận ${minToHHMM(editing.s)} – ${minToHHMM(editing.e)}.`, "success");
+    }
+    setEditing(null);
   };
 
-  const dayIntervals = freeSlots[day] || [];
-
-  const removeInterval = (idx) => {
-    setFreeSlots((prev) => {
-      const list = (prev[day] || []).slice();
-      list.splice(idx, 1);
-      return { ...prev, [day]: list };
-    });
+  const remove = () => {
+    setBusySlots((prev) => removeBusyBlock(prev, day, id));
+    notify("Đã xoá khung giờ bận.", "success");
+    setEditing(null);
   };
 
   return (
     <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
-      <p className="mb-1 text-sm font-medium" style={{ color: INK }}>Chỉnh chính xác đến từng phút</p>
-      <p className="mb-3 text-xs" style={{ color: MUTED }}>VD: bận từ 10:35 đến 12:00 — chọn ngày, nhập giờ, chọn "Đánh dấu bận" rồi bấm Áp dụng. Có thể chọn lẻ tới 5 phút.</p>
-
+      <p className="mb-3 text-sm font-medium" style={{ color: INK }}>{id ? "Sửa khung giờ bận" : "Khung giờ bận mới"} — {DAYS[day].full}</p>
       <div className="flex flex-wrap items-end gap-2">
         <div>
-          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Ngày</label>
-          <select value={day} onChange={(e) => setDay(Number(e.target.value))} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
-            {DAYS.map((d, i) => <option key={d.short} value={i}>{d.full}</option>)}
-          </select>
-        </div>
-        <div>
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Bắt đầu</label>
-          <input type="time" step={TIME_STEP_MIN * 60} value={start} onChange={(e) => setStart(e.target.value)} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
+          <input type="time" step={TIME_STEP_MIN * 60} value={minToHHMM(editing.s)} onChange={(ev) => setField({ s: roundToStep(hhmmToMin(ev.target.value)) })} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
         </div>
         <div>
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Kết thúc</label>
-          <input type="time" step={TIME_STEP_MIN * 60} value={end} onChange={(e) => setEnd(e.target.value)} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
+          <input type="time" step={TIME_STEP_MIN * 60} value={minToHHMM(editing.e)} onChange={(ev) => setField({ e: roundToStep(hhmmToMin(ev.target.value)) })} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
         </div>
-        <div className="flex gap-1 rounded-full border p-1" style={{ borderColor: BORDER }}>
-          <button type="button" onClick={() => setAction("free")} className="rounded-full px-3 py-1.5 text-xs font-semibold transition-colors" style={{ backgroundColor: action === "free" ? PRIMARY : "transparent", color: action === "free" ? "#FFFFFF" : "#8A6070" }}>Đánh dấu rảnh</button>
-          <button type="button" onClick={() => setAction("busy")} className="rounded-full px-3 py-1.5 text-xs font-semibold transition-colors" style={{ backgroundColor: action === "busy" ? DANGER : "transparent", color: action === "busy" ? "#FFFFFF" : "#8A6070" }}>Đánh dấu bận</button>
+        <div className="min-w-[180px] flex-1">
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Đang bận việc gì?</label>
+          <input value={editing.note} onChange={(ev) => setField({ note: ev.target.value })} placeholder="VD: Dạy lớp HSK3" className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
         </div>
-        <button onClick={apply} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-semibold text-white" style={{ backgroundColor: SECONDARY, color: "#5A4405", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
-          <CheckCircle2 size={14} /> Áp dụng
+        <button onClick={save} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-semibold text-white" style={{ backgroundColor: SECONDARY, color: "#5A4405", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
+          <CheckCircle2 size={14} /> Lưu
         </button>
-      </div>
-
-      <div className="mt-4">
-        <p className="mb-2 text-xs" style={{ color: MUTED }}>Khung giờ rảnh của {DAYS[day].full}{dayIntervals.length === 0 ? " — chưa có khung nào." : ":"}</p>
-        {dayIntervals.length > 0 && (
-          <div className="flex flex-wrap gap-2">
-            {dayIntervals.map(([s, e], idx) => (
-              <span key={idx} className="flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs" style={{ borderColor: BORDER, color: INK, backgroundColor: "#FFF6FA" }}>
-                {minToHHMM(s)} – {minToHHMM(e)}
-                <button onClick={() => removeInterval(idx)} style={{ color: MUTED_LIGHT }}><XIcon size={11} /></button>
-              </span>
-            ))}
-          </div>
+        {id && (
+          <button onClick={remove} className="flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: DANGER }}>
+            <Trash2 size={13} /> Xoá
+          </button>
         )}
+        <button onClick={() => setEditing(null)} className="rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
+          Huỷ
+        </button>
       </div>
     </div>
   );
@@ -719,7 +826,7 @@ function PreciseTimeEditor({ freeSlots, setFreeSlots, notify }) {
 /*  View: Assistant                                                       */
 /* ---------------------------------------------------------------------- */
 
-function AssistantView({ tasks, setTasks, freeSlots, notify }) {
+function AssistantView({ tasks, setTasks, busySlots, notify }) {
   const [form, setForm] = useState({ name: "", category: "hoc", duration: 1, deadlineDay: 4, deadlineHour: 18 });
 
   const addTask = () => {
@@ -732,7 +839,7 @@ function AssistantView({ tasks, setTasks, freeSlots, notify }) {
   const unschedule = (id) => setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "pending", scheduledDay: null, scheduledStart: null } : t)));
 
   const runAuto = () => {
-    const results = autoSchedule(tasks, freeSlots);
+    const results = autoSchedule(tasks, busySlots);
     const ids = Object.keys(results);
     if (!ids.length) { notify("Không có việc nào đang chờ sắp xếp.", "error"); return; }
     setTasks((prev) => prev.map((t) => (results[t.id] ? { ...t, ...results[t.id] } : t)));
@@ -1006,14 +1113,14 @@ function AuthScreen({ notify }) {
 
 const TABS = [
   { id: "dashboard", label: "Tổng quan", icon: LayoutGrid },
-  { id: "slots", label: "Khung giờ rảnh", icon: Clock3 },
+  { id: "slots", label: "Khung giờ bận", icon: Clock3 },
   { id: "assistant", label: "Trợ lý sắp xếp", icon: Sparkles },
 ];
 
 function App() {
   const [user, setUser] = useState(undefined); // undefined = đang kiểm tra, null = chưa đăng nhập
   const [view, setView] = useState("dashboard");
-  const [freeSlots, setFreeSlots] = useState({});
+  const [busySlots, setBusySlots] = useState({});
   const [tasks, setTasks] = useState([]);
   const [dataLoading, setDataLoading] = useState(true);
   const [toast, setToast] = useState(null);
@@ -1044,24 +1151,30 @@ function App() {
       if (cancelled) return;
       if (snap.exists) {
         const data = snap.data() || {};
-        const rawFree = data.freeSlots || {};
-        const looksOld = Object.keys(rawFree).some((k) => k.includes("-"));
-        const migratedFree = normalizeLoadedFreeSlots(rawFree);
-        skipNextSave.current = true;
-        setFreeSlots(migratedFree);
-        setTasks(data.tasks || []);
-        // Nếu dữ liệu cũ (theo giờ) vừa được chuyển sang định dạng theo phút,
-        // lưu lại luôn để lần sau không phải chuyển đổi lại.
-        if (looksOld) ref.set({ freeSlots: serializeFreeSlots(migratedFree) }, { merge: true }).catch(() => {});
+        if (data.busySlots) {
+          const loadedBusy = normalizeLoadedBusySlots(data.busySlots);
+          skipNextSave.current = true;
+          setBusySlots(loadedBusy);
+          setTasks(data.tasks || []);
+        } else {
+          // Dữ liệu cũ chỉ có "freeSlots" (khung giờ rảnh) — chuyển sang mô
+          // hình "khung giờ bận" mới bằng phần bù, rồi lưu lại luôn.
+          const oldFree = normalizeLoadedFreeIntervals(data.freeSlots || {});
+          const migratedBusy = migrateFreeToBusySlots(oldFree);
+          skipNextSave.current = true;
+          setBusySlots(migratedBusy);
+          setTasks(data.tasks || []);
+          ref.set({ busySlots: migratedBusy }, { merge: true }).catch(() => {});
+        }
       } else {
         const rawInitFree = loadLS(LS_FREE, null);
-        const initFree = rawInitFree ? normalizeLoadedFreeSlots(rawInitFree) : seedDefaultFreeSlots();
+        const initBusy = rawInitFree ? migrateFreeToBusySlots(normalizeLoadedFreeIntervals(rawInitFree)) : {};
         const initTasks = loadLS(LS_TASKS, null) || [];
         skipNextSave.current = true;
-        setFreeSlots(initFree);
+        setBusySlots(initBusy);
         setTasks(initTasks);
         ref.set({
-          freeSlots: serializeFreeSlots(initFree),
+          busySlots: initBusy,
           tasks: initTasks,
           email: user.email || null,
           updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
@@ -1084,7 +1197,7 @@ function App() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       db.collection("users").doc(user.uid).set({
-        freeSlots: serializeFreeSlots(freeSlots), tasks,
+        busySlots, tasks,
         email: user.email || null,
         updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       }, { merge: true }).then(() => {
@@ -1093,12 +1206,12 @@ function App() {
       }).catch(() => notify("Lưu dữ liệu thất bại, kiểm tra kết nối mạng.", "error"));
     }, 600);
     return () => clearTimeout(saveTimer.current);
-  }, [freeSlots, tasks, user, dataLoading]);
+  }, [busySlots, tasks, user, dataLoading]);
 
   const handleLogout = async () => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     await auth.signOut();
-    setFreeSlots({});
+    setBusySlots({});
     setTasks([]);
     setDataLoading(true);
   };
@@ -1108,16 +1221,16 @@ function App() {
     const task = tasks.find((t) => t.id === taskId);
     if (!task) return;
     const occupied = buildOccupied(tasks, task.id);
-    if (hour + task.duration - 1 > HOUR_END || !canPlace(freeSlots, occupied, day, hour, task.duration, task.id)) {
-      notify("Không thể đặt vào đây — trùng lịch hoặc ngoài khung giờ rảnh.", "error");
+    if (hour + task.duration - 1 > HOUR_END || !canPlace(busySlots, occupied, day, hour, task.duration, task.id)) {
+      notify("Không thể đặt vào đây — trùng lịch hoặc đã bị đánh dấu bận.", "error");
       return;
     }
     setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: "scheduled", scheduledDay: day, scheduledStart: hour } : t)));
   };
 
   const resetAllData = () => {
-    if (!window.confirm("Xoá toàn bộ dữ liệu đã lưu (khung giờ rảnh + việc cần làm)?")) return;
-    setFreeSlots({});
+    if (!window.confirm("Xoá toàn bộ dữ liệu đã lưu (khung giờ bận + việc cần làm)?")) return;
+    setBusySlots({});
     setTasks([]);
     notify("Đã xoá toàn bộ dữ liệu.", "success");
   };
@@ -1173,9 +1286,9 @@ function App() {
       </header>
 
       <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
-        {view === "dashboard" && <DashboardView freeSlots={freeSlots} tasks={tasks} onDropTask={handleDropTask} />}
-        {view === "slots" && <SlotEditorView freeSlots={freeSlots} setFreeSlots={setFreeSlots} notify={notify} />}
-        {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} freeSlots={freeSlots} notify={notify} />}
+        {view === "dashboard" && <DashboardView busySlots={busySlots} tasks={tasks} onDropTask={handleDropTask} />}
+        {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} notify={notify} />}
+        {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} busySlots={busySlots} notify={notify} />}
       </main>
 
       <Toast toast={toast} onClose={() => setToast(null)} />
