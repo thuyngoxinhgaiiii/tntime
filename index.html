@@ -745,7 +745,15 @@ function SlotEditorView({ busySlots, setBusySlots, notify }) {
         </div>
         <BusyEditorGrid
           busySlots={busySlots}
-          onCreateDraft={(day, s, e) => setEditing({ day, id: null, s, e, note: "" })}
+          onCreateDraft={(day, s, e) => {
+            // Cố định khối ngay khi thả chuột, để khung giờ không "biến mất"
+            // sau khi kéo — form bên dưới chỉ dùng để ghi chú / chỉnh thêm.
+            const [cs, ce] = clampRange(s, e);
+            if (ce <= cs) return;
+            const newId = uid();
+            setBusySlots((prev) => ({ ...prev, [day]: [...(prev[day] || []), { id: newId, s: cs, e: ce, note: "" }] }));
+            setEditing({ day, id: newId, s: cs, e: ce, note: "", isDraft: true });
+          }}
           onSelectBlock={(day, block) => setEditing({ day, id: block.id, s: block.s, e: block.e, note: block.note || "" })}
         />
       </div>
@@ -817,7 +825,15 @@ function BusyBlockForm({ editing, setEditing, setBusySlots, notify }) {
             <Trash2 size={13} /> Xoá
           </button>
         )}
-        <button onClick={() => setEditing(null)} className="rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
+        <button
+          onClick={() => {
+            // Nếu đang huỷ 1 khối vừa kéo (chưa từng lưu ghi chú), xoá luôn
+            // khối đó thay vì để lại 1 khung giờ bận trống không mong muốn.
+            if (editing.isDraft) setBusySlots((prev) => removeBusyBlock(prev, day, id));
+            setEditing(null);
+          }}
+          className="rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}
+        >
           Huỷ
         </button>
       </div>
