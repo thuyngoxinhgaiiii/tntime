@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TNTime — Tối ưu thời gian trống</title>
+
+<!-- Tailwind CSS (CDN, không cần build) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React + ReactDOM (UMD, chạy thẳng trên trình duyệt) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+
+<!-- Babel Standalone: cho phép viết JSX ngay trong file, không cần bước build -->
+<!-- Ghim phiên bản 7.x: bản "latest" (Babel 8) mặc định biên dịch JSX theo kiểu
+     "automatic", tự chèn câu lệnh import — gây lỗi cú pháp vì script bên dưới
+     không được khai báo là module. Bản 7.x biên dịch theo kiểu cũ (React.createElement),
+     chạy tốt trong thẻ script thường. -->
+<script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js"></script>
+
+<!-- Firebase (bản "compat"): dùng để đăng nhập (Auth) và lưu dữ liệu nhiều
+     người dùng (Firestore). Bản compat lộ ra biến toàn cục `firebase`, dùng
+     được luôn trong thẻ <script> thường, không cần import kiểu module. -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap');
+  html, body { margin: 0; padding: 0; background-color: #FFF6FA; font-family: 'Inter', system-ui, sans-serif; overflow-x: hidden; }
+  ::-webkit-scrollbar { height: 8px; width: 8px; }
+  ::-webkit-scrollbar-thumb { background: #F6D6E4; border-radius: 8px; }
+  select, input { background-color: #FFFFFF; }
+  .bg-blob { position: fixed; border-radius: 999px; filter: blur(2px); pointer-events: none; z-index: 0; }
+  @keyframes floaty { 0%,100% { transform: translateY(0px); } 50% { transform: translateY(-6px); } }
+  .float-slow { animation: floaty 6s ease-in-out infinite; }
+  .float-slower { animation: floaty 8s ease-in-out infinite; animation-delay: .8s; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useMemo, useEffect, useCallback, useRef } = React;
+
+/* ---------------------------------------------------------------------- */
+/*  Firebase — cấu hình Auth (đăng nhập) & Firestore (dữ liệu nhiều người) */
+/* ---------------------------------------------------------------------- */
+
+// ⚠️ THAY các giá trị bên dưới bằng cấu hình lấy từ Firebase Console của
+// bạn: Project settings (biểu tượng bánh răng) → General → cuộn xuống
+// "Your apps" → chọn app Web (</>) → mục "SDK setup and configuration".
+const firebaseConfig = {
+  apiKey: "AIzaSyAe8idwRDILB5qALUQSKdM9-EZq_C1920g",
+  authDomain: "tntime-b0d74.firebaseapp.com",
+  projectId: "tntime-b0d74",
+  storageBucket: "tntime-b0d74.firebasestorage.app",
+  messagingSenderId: "857803558509",
+  appId: "1:857803558509:web:222fc184c11ff624c87964",
+};
+
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+
+/* ---------------------------------------------------------------------- */
+/*  Minimal inline icon set (no external icon library required)           */
+/* ---------------------------------------------------------------------- */
+
+function makeIcon(children, viewBox = "0 0 24 24") {
+  return function IconComp({ size = 16, className = "", style = {}, strokeWidth = 2 }) {
+    return (
+      <svg width={size} height={size} viewBox={viewBox} fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" className={className} style={style}>
+        {children}
+      </svg>
+    );
+  };
+}
+
+const Clock3 = makeIcon(<><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>);
+const Plus = makeIcon(<><path d="M12 5v14" /><path d="M5 12h14" /></>);
+const Trash2 = makeIcon(<><path d="M4 7h16" /><path d="M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13" /><path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3" /></>);
+const Sparkles = makeIcon(<><path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z" /><path d="M19 15l.7 1.9L21.5 17.6l-1.8.7L19 20.2l-.7-1.9-1.8-.7 1.8-.7L19 15z" /></>);
+const LayoutGrid = makeIcon(<><rect x="3" y="3" width="8" height="8" rx="1.5" /><rect x="13" y="3" width="8" height="8" rx="1.5" /><rect x="3" y="13" width="8" height="8" rx="1.5" /><rect x="13" y="13" width="8" height="8" rx="1.5" /></>);
+const CalendarClock = makeIcon(<><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M3 10h18" /><path d="M8 3v4" /><path d="M16 3v4" /><circle cx="16" cy="16" r="3.2" /><path d="M16 14.6V16l1 .8" /></>);
+const XIcon = makeIcon(<><path d="M6 6l12 12" /><path d="M18 6L6 18" /></>);
+const AlertTriangle = makeIcon(<><path d="M12 4L3 20h18L12 4z" /><path d="M12 10v4" /><circle cx="12" cy="17" r="0.6" fill="currentColor" /></>);
+const GripVertical = makeIcon(<><circle cx="9" cy="6" r="1" fill="currentColor" /><circle cx="9" cy="12" r="1" fill="currentColor" /><circle cx="9" cy="18" r="1" fill="currentColor" /><circle cx="15" cy="6" r="1" fill="currentColor" /><circle cx="15" cy="12" r="1" fill="currentColor" /><circle cx="15" cy="18" r="1" fill="currentColor" /></>);
+const ListChecks = makeIcon(<><path d="M4 6l1.5 1.5L8 5" /><path d="M11 6h9" /><path d="M4 12l1.5 1.5L8 11" /><path d="M11 12h9" /><path d="M4 18l1.5 1.5L8 17" /><path d="M11 18h9" /></>);
+const PenSquare = makeIcon(<><path d="M11 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-5" /><path d="M18.4 3.6a1.7 1.7 0 0 1 2.4 2.4L13 13.7 9.5 14.5 10.3 11l8.1-7.4z" /></>);
+const RotateCcw = makeIcon(<><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></>);
+const CheckCircle2 = makeIcon(<><circle cx="12" cy="12" r="9" /><path d="M8.5 12.5l2.3 2.3L16 10" /></>);
+const Save = makeIcon(<><path d="M5 4h11l3 3v13H5V4z" /><path d="M8 4v5h7V4" /><path d="M8 14h8v6H8z" /></>);
+
+/* ---------------------------------------------------------------------- */
+/*  Original decorative motifs — clouds, rainbow, flowers (hand-drawn     */
+/*  SVGs made for this app; not traced from any licensed artwork)         */
+/* ---------------------------------------------------------------------- */
+
+function Cloud({ style = {}, size = 90, color = "#FFFFFF", opacity = 1, className = "" }) {
+  return (
+    <svg width={size} height={size * 0.6} viewBox="0 0 100 60" style={style} className={className} opacity={opacity}>
+      <ellipse cx="30" cy="38" rx="24" ry="18" fill={color} />
+      <ellipse cx="55" cy="26" rx="26" ry="22" fill={color} />
+      <ellipse cx="78" cy="38" rx="20" ry="16" fill={color} />
+      <ellipse cx="50" cy="44" rx="42" ry="14" fill={color} />
+    </svg>
+  );
+}
+
+function Rainbow({ style = {}, size = 140, opacity = 1 }) {
+  const bands = ["#F2699B", "#FFA94D", "#FFC94D", "#7CC576", "#7EC8E3", "#B79CE0"];
+  const r0 = size / 2;
+  return (
+    <svg width={size} height={size / 2 + 6} viewBox={`0 0 ${size} ${size / 2 + 6}`} style={style} opacity={opacity}>
+      {bands.map((c, i) => {
+        const r = r0 - i * (r0 / bands.length) * 0.92;
+        return (
+          <path
+            key={c}
+            d={`M ${size / 2 - r} ${size / 2} A ${r} ${r} 0 0 1 ${size / 2 + r} ${size / 2}`}
+            stroke={c}
+            strokeWidth={(r0 / bands.length) * 0.85}
+            fill="none"
+            strokeLinecap="round"
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
+function Flower({ size = 28, petal = "#F2699B", center = "#FFC94D", style = {}, rotate = 0 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 40 40" style={{ transform: `rotate(${rotate}deg)`, ...style }}>
+      {[0, 72, 144, 216, 288].map((deg) => (
+        <ellipse key={deg} cx="20" cy="10" rx="6.5" ry="9" fill={petal} transform={`rotate(${deg} 20 20)`} opacity="0.95" />
+      ))}
+      <circle cx="20" cy="20" r="6" fill={center} />
+    </svg>
+  );
+}
+
+const FLOWER_COLORS = ["#F2699B", "#FFA94D", "#B79CE0", "#FFC94D", "#7CC576", "#7EC8E3"];
+
+function FlowerDivider() {
+  return (
+    <div className="flex items-center justify-center gap-3 py-2 opacity-90" aria-hidden="true">
+      {FLOWER_COLORS.map((c, i) => (
+        <Flower key={i} size={i % 2 === 0 ? 20 : 15} petal={c} center="#FFF6FA" rotate={i * 23} />
+      ))}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Constants & design tokens                                             */
+/* ---------------------------------------------------------------------- */
+
+const DAYS = [
+  { short: "T2", full: "Thứ 2" },
+  { short: "T3", full: "Thứ 3" },
+  { short: "T4", full: "Thứ 4" },
+  { short: "T5", full: "Thứ 5" },
+  { short: "T6", full: "Thứ 6" },
+  { short: "T7", full: "Thứ 7" },
+  { short: "CN", full: "Chủ nhật" },
+];
+
+const HOUR_START = 6;
+const HOUR_END = 22;
+const HOURS = Array.from({ length: HOUR_END - HOUR_START + 1 }, (_, i) => HOUR_START + i);
+
+const CATEGORIES = [
+  { id: "hoc", label: "Học trên lớp", bg: "#FDEAF2", border: "#F2699B", text: "#B23D6F" },
+  { id: "btvn", label: "Bài tập", bg: "#FFF6DE", border: "#FFC94D", text: "#9C7A12" },
+  { id: "on", label: "Ôn thi", bg: "#F3EDFB", border: "#B79CE0", text: "#6B4FA0" },
+  { id: "clb", label: "CLB / Ngoại khoá", bg: "#FFEEE0", border: "#FFA94D", text: "#B15C0E" },
+  { id: "khac", label: "Việc khác", bg: "#EAF7E8", border: "#7CC576", text: "#3E7A38" },
+];
+const catOf = (id) => CATEGORIES.find((c) => c.id === id) || CATEGORIES[CATEGORIES.length - 1];
+
+const key = (day, hour) => `${day}-${hour}`;
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+/* palette tokens */
+const INK = "#4A2E3E";
+const MUTED = "#B98CA0";
+const MUTED_LIGHT = "#D9B9C8";
+const BORDER = "#F6D6E4";
+const CARD = "#FFFFFF";
+const PRIMARY = "#F2699B";
+const SECONDARY = "#FFC94D";
+const PURPLE = "#B79CE0";
+const DANGER = "#E0637E";
+
+/* ---------------------------------------------------------------------- */
+/*  localStorage persistence                                              */
+/* ---------------------------------------------------------------------- */
+
+const LS_FREE = "tntime_free_slots_v1";
+const LS_TASKS = "tntime_tasks_v1";
+
+function loadLS(k, fallback) {
+  try {
+    const raw = localStorage.getItem(k);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function seedDefaultFreeSlots() {
+  const seed = {};
+  [1, 2, 3, 4].forEach((day) => { for (let h = 19; h <= 21; h++) seed[key(day, h)] = true; });
+  [5, 6].forEach((day) => { for (let h = 9; h <= 16; h++) seed[key(day, h)] = true; });
+  return seed;
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Scheduling helpers                                                    */
+/* ---------------------------------------------------------------------- */
+
+function canPlace(freeSlots, occupied, day, start, duration, excludeId) {
+  for (let i = 0; i < duration; i++) {
+    const h = start + i;
+    if (h > HOUR_END) return false;
+    const k = key(day, h);
+    if (!freeSlots[k]) return false;
+    if (occupied[k] && occupied[k] !== excludeId) return false;
+  }
+  return true;
+}
+
+function buildOccupied(tasks, excludeId) {
+  const occ = {};
+  tasks.forEach((t) => {
+    if (t.status === "scheduled" && t.id !== excludeId) {
+      for (let i = 0; i < t.duration; i++) occ[key(t.scheduledDay, t.scheduledStart + i)] = t.id;
+    }
+  });
+  return occ;
+}
+
+function autoSchedule(tasks, freeSlots) {
+  const occupied = buildOccupied(tasks, null);
+  const pending = tasks
+    .filter((t) => t.status !== "scheduled")
+    .slice()
+    .sort((a, b) => {
+      const da = a.deadlineDay * 100 + a.deadlineHour;
+      const db = b.deadlineDay * 100 + b.deadlineHour;
+      if (da !== db) return da - db;
+      return b.duration - a.duration;
+    });
+
+  const results = {};
+  pending.forEach((t) => {
+    let placed = false;
+    for (let day = 0; day <= t.deadlineDay && !placed; day++) {
+      const upperBound = day === t.deadlineDay
+        ? Math.min(HOUR_END - t.duration + 1, t.deadlineHour - t.duration)
+        : HOUR_END - t.duration + 1;
+      for (let h = HOUR_START; h <= upperBound; h++) {
+        if (canPlace(freeSlots, occupied, day, h, t.duration, null)) {
+          for (let i = 0; i < t.duration; i++) occupied[key(day, h + i)] = t.id;
+          results[t.id] = { scheduledDay: day, scheduledStart: h, status: "scheduled" };
+          placed = true;
+          break;
+        }
+      }
+    }
+    if (!placed) results[t.id] = { scheduledDay: null, scheduledStart: null, status: "unscheduled" };
+  });
+  return results;
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Small UI atoms                                                        */
+/* ---------------------------------------------------------------------- */
+
+function StatCard({ icon: Icon, label, value, sub, accent }) {
+  return (
+    <div className="flex items-center gap-3 rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full" style={{ backgroundColor: accent + "22", color: accent }}>
+        <Icon size={18} strokeWidth={2} />
+      </div>
+      <div>
+        <p className="text-xs" style={{ color: MUTED }}>{label}</p>
+        <p className="text-xl font-semibold leading-tight" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{value}</p>
+        {sub && <p className="text-xs" style={{ color: MUTED_LIGHT }}>{sub}</p>}
+      </div>
+    </div>
+  );
+}
+
+function Toast({ toast, onClose }) {
+  if (!toast) return null;
+  const isError = toast.type === "error";
+  return (
+    <div className="fixed bottom-5 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full px-4 py-2.5 text-sm shadow-lg" style={{ backgroundColor: isError ? "#7A3348" : "#3D6B45", color: "#FFF6FA" }}>
+      {isError ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
+      <span>{toast.message}</span>
+      <button onClick={onClose} className="ml-1 opacity-70 hover:opacity-100"><XIcon size={14} /></button>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Week grid — shared between Slot Editor & Dashboard                    */
+/* ---------------------------------------------------------------------- */
+
+function WeekGrid({ mode, freeSlots, tasks, onPaintStart, onPaintEnter, onDropTask, selectedTaskId, onSelectTask }) {
+  const rowH = 34;
+  const labelW = 54;
+  const [dragOverKey, setDragOverKey] = useState(null);
+
+  return (
+    <div className="overflow-x-auto">
+      <div className="grid select-none" style={{ gridTemplateColumns: `${labelW}px repeat(7, minmax(64px, 1fr))`, gridTemplateRows: `32px repeat(${HOURS.length}, ${rowH}px)`, minWidth: 640 }}>
+        <div style={{ gridColumn: 1, gridRow: 1 }} />
+        {DAYS.map((d, di) => (
+          <div key={d.short} className="flex items-end justify-center pb-1 text-xs font-semibold" style={{ gridColumn: di + 2, gridRow: 1, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
+        ))}
+        {HOURS.map((h, hi) => (
+          <div key={"lbl-" + h} className="flex items-start justify-end pr-2 text-[11px]" style={{ gridColumn: 1, gridRow: hi + 2, color: MUTED_LIGHT, transform: "translateY(-6px)" }}>{h}:00</div>
+        ))}
+        {DAYS.map((d, di) =>
+          HOURS.map((h, hi) => {
+            const k = key(di, h);
+            const isFree = !!freeSlots[k];
+            const isOver = dragOverKey === k;
+            return (
+              <div
+                key={k}
+                onMouseDown={mode === "paint" ? () => onPaintStart(di, h) : undefined}
+                onMouseEnter={mode === "paint" ? () => onPaintEnter(di, h) : undefined}
+                onDragOver={mode === "display" ? (e) => { e.preventDefault(); setDragOverKey(k); } : undefined}
+                onDragLeave={mode === "display" ? () => setDragOverKey((prev) => (prev === k ? null : prev)) : undefined}
+                onDrop={mode === "display" ? (e) => { e.preventDefault(); setDragOverKey(null); onDropTask(di, h); } : undefined}
+                style={{
+                  gridColumn: di + 2, gridRow: hi + 2,
+                  backgroundColor: isFree ? (isOver ? "#FBD9E7" : "#FEF1F6") : "#FFFCFD",
+                  borderTop: "1px solid #FBEAF1",
+                  borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7",
+                  borderRight: "1px solid #FDF3F7",
+                  cursor: mode === "paint" ? "pointer" : "default",
+                  outline: isOver ? "2px dashed " + SECONDARY : "none",
+                  outlineOffset: "-2px",
+                }}
+              />
+            );
+          })
+        )}
+        {mode === "display" &&
+          tasks.filter((t) => t.status === "scheduled").map((t) => {
+            const c = catOf(t.category);
+            const selected = selectedTaskId === t.id;
+            return (
+              <div
+                key={t.id}
+                draggable
+                onDragStart={(e) => e.dataTransfer.setData("text/plain", t.id)}
+                onClick={() => onSelectTask(t.id)}
+                title={`${t.name} · ${t.duration}h`}
+                className="z-10 mx-0.5 my-0.5 flex cursor-grab items-center gap-1 overflow-hidden rounded-xl border px-1.5 text-[11px] font-medium leading-tight active:cursor-grabbing"
+                style={{ gridColumn: t.scheduledDay + 2, gridRow: `${HOURS.indexOf(t.scheduledStart) + 2} / span ${t.duration}`, backgroundColor: c.bg, borderColor: selected ? c.text : c.border, borderWidth: selected ? 2 : 1, color: c.text, boxShadow: selected ? "0 0 0 2px " + c.bg : "none" }}
+              >
+                <GripVertical size={11} className="shrink-0 opacity-50" />
+                <span className="truncate">{t.name}</span>
+              </div>
+            );
+          })}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  View: Dashboard                                                       */
+/* ---------------------------------------------------------------------- */
+
+function DashboardView({ freeSlots, tasks, onDropTask }) {
+  const [selectedTaskId, setSelectedTaskId] = useState(null);
+  const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
+
+  const totalFree = Object.values(freeSlots).filter(Boolean).length;
+  const scheduled = tasks.filter((t) => t.status === "scheduled");
+  const scheduledHours = scheduled.reduce((s, t) => s + t.duration, 0);
+  const unscheduledCount = tasks.filter((t) => t.status === "unscheduled").length;
+  const utilization = totalFree ? Math.round((scheduledHours / totalFree) * 100) : 0;
+
+  const perDay = DAYS.map((d, di) => {
+    const free = HOURS.filter((h) => freeSlots[key(di, h)]).length;
+    const busy = scheduled.filter((t) => t.scheduledDay === di).reduce((s, t) => s + t.duration, 0);
+    return { ...d, free, busy };
+  });
+  const maxHours = Math.max(1, ...perDay.map((d) => Math.max(d.free, d.busy + d.free)));
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <StatCard icon={Clock3} label="Giờ rảnh / tuần" value={`${totalFree}h`} accent={PRIMARY} />
+        <StatCard icon={CalendarClock} label="Đã sắp xếp" value={`${scheduledHours}h`} sub={`${scheduled.length} việc`} accent={SECONDARY} />
+        <StatCard icon={LayoutGrid} label="Tỷ lệ sử dụng" value={`${utilization}%`} accent={PURPLE} />
+        <StatCard icon={AlertTriangle} label="Chưa sắp xếp được" value={unscheduledCount} sub={unscheduledCount ? "cần điều chỉnh" : "ổn"} accent={DANGER} />
+      </div>
+
+      <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <p className="mb-3 text-sm font-medium" style={{ color: INK }}>Thời gian rảnh & đã dùng theo ngày</p>
+        <div className="space-y-2">
+          {perDay.map((d) => (
+            <div key={d.short} className="flex items-center gap-3">
+              <span className="w-9 text-xs" style={{ color: MUTED }}>{d.short}</span>
+              <div className="relative h-4 flex-1 overflow-hidden rounded-full" style={{ backgroundColor: "#FBEAF1" }}>
+                <div className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${(d.free / maxHours) * 100}%`, backgroundColor: "#FBD9E7" }} />
+                <div className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${(d.busy / maxHours) * 100}%`, backgroundColor: SECONDARY }} />
+              </div>
+              <span className="w-16 text-right text-[11px]" style={{ color: MUTED_LIGHT }}>{d.busy}h / {d.free}h</span>
+            </div>
+          ))}
+        </div>
+        <div className="mt-3 flex items-center gap-4 text-[11px]" style={{ color: MUTED }}>
+          <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: "#FBD9E7" }} /> Rảnh</span>
+          <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: SECONDARY }} /> Đã sắp lịch</span>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <div className="mb-3 flex items-center justify-between">
+          <p className="text-sm font-medium" style={{ color: INK }}>Lịch tuần — kéo khối việc để đổi giờ</p>
+          {selectedTask && <span className="text-xs" style={{ color: MUTED }}>Đang chọn: <b style={{ color: catOf(selectedTask.category).text }}>{selectedTask.name}</b></span>}
+        </div>
+        <WeekGrid mode="display" freeSlots={freeSlots} tasks={tasks} onDropTask={(day, hour) => onDropTask(selectedTaskId, day, hour)} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} />
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  View: Slot editor                                                     */
+/* ---------------------------------------------------------------------- */
+
+function SlotEditorView({ freeSlots, setFreeSlots }) {
+  const paintMode = useRef(null);
+
+  useEffect(() => {
+    const up = () => (paintMode.current = null);
+    window.addEventListener("mouseup", up);
+    return () => window.removeEventListener("mouseup", up);
+  }, []);
+
+  const applyCell = (day, hour, mode) => {
+    setFreeSlots((prev) => {
+      const next = { ...prev };
+      const k = key(day, hour);
+      if (mode === "add") next[k] = true; else delete next[k];
+      return next;
+    });
+  };
+  const handleStart = (day, hour) => {
+    const mode = freeSlots[key(day, hour)] ? "remove" : "add";
+    paintMode.current = mode;
+    applyCell(day, hour, mode);
+  };
+  const handleEnter = (day, hour) => { if (paintMode.current) applyCell(day, hour, paintMode.current); };
+
+  const totalFree = Object.values(freeSlots).filter(Boolean).length;
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ rảnh</p>
+            <p className="text-xs" style={{ color: MUTED }}>Nhấn giữ và kéo qua nhiều ô để chọn nhanh · {totalFree}h rảnh / tuần</p>
+          </div>
+          <button onClick={() => setFreeSlots({})} className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
+            <RotateCcw size={13} /> Xoá tất cả
+          </button>
+        </div>
+        <WeekGrid mode="paint" freeSlots={freeSlots} tasks={[]} onPaintStart={handleStart} onPaintEnter={handleEnter} />
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  View: Assistant                                                       */
+/* ---------------------------------------------------------------------- */
+
+function AssistantView({ tasks, setTasks, freeSlots, notify }) {
+  const [form, setForm] = useState({ name: "", category: "hoc", duration: 1, deadlineDay: 4, deadlineHour: 18 });
+
+  const addTask = () => {
+    if (!form.name.trim()) { notify("Nhập tên việc cần làm trước đã nhé.", "error"); return; }
+    if (form.deadlineHour - form.duration < HOUR_START) { notify("Deadline quá sớm so với thời lượng, hãy chọn giờ muộn hơn.", "error"); return; }
+    setTasks((prev) => [...prev, { id: uid(), name: form.name.trim(), category: form.category, duration: Number(form.duration), deadlineDay: Number(form.deadlineDay), deadlineHour: Number(form.deadlineHour), status: "pending", scheduledDay: null, scheduledStart: null }]);
+    setForm((f) => ({ ...f, name: "" }));
+  };
+  const removeTask = (id) => setTasks((prev) => prev.filter((t) => t.id !== id));
+  const unschedule = (id) => setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "pending", scheduledDay: null, scheduledStart: null } : t)));
+
+  const runAuto = () => {
+    const results = autoSchedule(tasks, freeSlots);
+    const ids = Object.keys(results);
+    if (!ids.length) { notify("Không có việc nào đang chờ sắp xếp.", "error"); return; }
+    setTasks((prev) => prev.map((t) => (results[t.id] ? { ...t, ...results[t.id] } : t)));
+    const okCount = Object.values(results).filter((r) => r.status === "scheduled").length;
+    const failCount = ids.length - okCount;
+    notify(failCount ? `Đã sắp xếp ${okCount} việc, còn ${failCount} việc chưa tìm được chỗ trống phù hợp.` : `Đã sắp xếp thành công ${okCount} việc vào thời gian rảnh.`, failCount ? "error" : "success");
+  };
+
+  const pending = tasks.filter((t) => t.status !== "scheduled");
+  const scheduled = tasks.filter((t) => t.status === "scheduled");
+
+  return (
+    <div className="grid gap-6 lg:grid-cols-[340px_1fr]">
+      <div className="h-fit space-y-3 rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <p className="flex items-center gap-2 text-sm font-medium" style={{ color: INK }}><PenSquare size={15} /> Thêm việc cần làm</p>
+        <div>
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Tên lớp học / việc cần làm</label>
+          <input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") addTask(); }} placeholder="VD: Ôn tập HSK4, Bài tập Toán..." className="w-full rounded-xl border px-3 py-2 text-sm outline-none focus:ring-2" style={{ borderColor: BORDER, color: INK }} />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Phân loại</label>
+          <select value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
+            {CATEGORIES.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+          </select>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Thời lượng (giờ)</label>
+            <select value={form.duration} onChange={(e) => setForm((f) => ({ ...f, duration: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
+              {[1, 2, 3, 4, 5, 6].map((n) => <option key={n} value={n}>{n}h</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Hạn chót — ngày</label>
+            <select value={form.deadlineDay} onChange={(e) => setForm((f) => ({ ...f, deadlineDay: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
+              {DAYS.map((d, i) => <option key={d.short} value={i}>{d.full}</option>)}
+            </select>
+          </div>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Hạn chót — trước giờ</label>
+          <select value={form.deadlineHour} onChange={(e) => setForm((f) => ({ ...f, deadlineHour: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
+            {Array.from({ length: 18 }, (_, i) => HOUR_START + 1 + i).map((h) => <option key={h} value={h}>{h}:00</option>)}
+          </select>
+        </div>
+        <button onClick={addTask} className="flex w-full items-center justify-center gap-1.5 rounded-full py-2 text-sm font-semibold text-white" style={{ backgroundColor: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
+          <Plus size={15} /> Thêm vào danh sách
+        </button>
+      </div>
+
+      <div className="space-y-5">
+        <div className="flex items-center justify-between">
+          <p className="flex items-center gap-2 text-sm font-medium" style={{ color: INK }}><ListChecks size={15} /> Danh sách chờ sắp xếp ({pending.length})</p>
+          <button onClick={runAuto} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-semibold text-white" style={{ backgroundColor: SECONDARY, color: "#5A4405", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
+            <Sparkles size={15} /> Sắp xếp thông minh
+          </button>
+        </div>
+
+        {pending.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed p-8 text-center" style={{ borderColor: BORDER }}>
+            <Flower size={30} petal={PRIMARY} center={SECONDARY} />
+            <p className="text-sm" style={{ color: MUTED }}>Chưa có việc nào đang chờ. Thêm việc ở form bên trái nhé.</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {pending.map((t) => {
+              const c = catOf(t.category);
+              return (
+                <div key={t.id} className="flex items-center justify-between rounded-xl border px-3 py-2.5" style={{ borderColor: t.status === "unscheduled" ? "#F3C1CE" : BORDER, backgroundColor: t.status === "unscheduled" ? "#FEF2F5" : CARD }}>
+                  <div className="flex items-center gap-2.5">
+                    <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: c.border }} />
+                    <div>
+                      <p className="text-sm font-medium" style={{ color: INK }}>{t.name}</p>
+                      <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>
+                        {c.label} · {t.duration}h · hạn {DAYS[t.deadlineDay].full} {t.deadlineHour}:00
+                        {t.status === "unscheduled" && <span style={{ color: DANGER }}> · chưa tìm được chỗ trống</span>}
+                      </p>
+                    </div>
+                  </div>
+                  <button onClick={() => removeTask(t.id)} className="rounded p-1.5 hover:bg-black/5" style={{ color: MUTED_LIGHT }}><Trash2 size={15} /></button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <p className="pt-2 text-sm font-medium" style={{ color: INK }}>Đã sắp xếp ({scheduled.length})</p>
+        {scheduled.length === 0 ? (
+          <p className="text-xs" style={{ color: MUTED_LIGHT }}>Chưa có việc nào được sắp lịch.</p>
+        ) : (
+          <div className="space-y-2">
+            {scheduled.map((t) => {
+              const c = catOf(t.category);
+              return (
+                <div key={t.id} className="flex items-center justify-between rounded-xl border px-3 py-2.5" style={{ borderColor: BORDER }}>
+                  <div className="flex items-center gap-2.5">
+                    <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: c.border }} />
+                    <div>
+                      <p className="text-sm font-medium" style={{ color: INK }}>{t.name}</p>
+                      <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>{DAYS[t.scheduledDay].full} · {t.scheduledStart}:00 – {t.scheduledStart + t.duration}:00</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button onClick={() => unschedule(t.id)} className="rounded px-2 py-1 text-[11px] font-medium hover:bg-black/5" style={{ color: "#8A6070" }}>Bỏ lịch</button>
+                    <button onClick={() => removeTask(t.id)} className="rounded p-1.5 hover:bg-black/5" style={{ color: MUTED_LIGHT }}><Trash2 size={15} /></button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Auth — màn hình đăng nhập / đăng ký                                   */
+/* ---------------------------------------------------------------------- */
+
+const AUTH_ERROR_MESSAGES = {
+  "auth/invalid-email": "Email không hợp lệ.",
+  "auth/user-disabled": "Tài khoản này đã bị vô hiệu hoá.",
+  "auth/user-not-found": "Không tìm thấy tài khoản với email này.",
+  "auth/wrong-password": "Sai mật khẩu.",
+  "auth/invalid-credential": "Email hoặc mật khẩu không đúng.",
+  "auth/email-already-in-use": "Email này đã được đăng ký, hãy chọn Đăng nhập.",
+  "auth/weak-password": "Mật khẩu cần ít nhất 6 ký tự.",
+  "auth/missing-password": "Vui lòng nhập mật khẩu.",
+  "auth/too-many-requests": "Bạn thử quá nhiều lần, vui lòng đợi một chút rồi thử lại.",
+  "auth/popup-closed-by-user": "Cửa sổ đăng nhập Google đã bị đóng trước khi hoàn tất.",
+  "auth/network-request-failed": "Lỗi kết nối mạng, hãy thử lại.",
+};
+const mapAuthError = (code) => AUTH_ERROR_MESSAGES[code] || "Có lỗi xảy ra, vui lòng thử lại.";
+
+function GoogleGlyph() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.9 32.6 29.4 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.5 6 29.5 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z" />
+      <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.9 18.9 13 24 13c3.1 0 5.8 1.1 8 3l6-6C34.5 6 29.5 4 24 4c-7.6 0-14.1 4.3-17.7 10.7z" />
+      <path fill="#4CAF50" d="M24 44c5.3 0 10.1-2 13.7-5.3l-6.3-5.3C29.4 35.4 26.8 36 24 36c-5.3 0-9.8-3.4-11.4-8.1l-6.5 5C9.8 39.6 16.4 44 24 44z" />
+      <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.2-4.2 5.6l6.3 5.3C40.5 36.4 44 30.8 44 24c0-1.3-.1-2.7-.4-3.5z" />
+    </svg>
+  );
+}
+
+function AuthBackdrop({ children }) {
+  return (
+    <div className="relative flex min-h-screen w-full items-center justify-center px-4 py-10" style={{ backgroundColor: "#FFF6FA" }}>
+      <div className="bg-blob" style={{ width: 320, height: 320, top: -120, left: -100, background: "radial-gradient(circle, #FDE3EE 0%, rgba(253,227,238,0) 70%)" }} />
+      <div className="bg-blob" style={{ width: 280, height: 280, bottom: -100, right: -80, background: "radial-gradient(circle, #FFF1D6 0%, rgba(255,241,214,0) 70%)" }} />
+      <div className="bg-blob" style={{ width: 220, height: 220, top: "40%", right: -110, background: "radial-gradient(circle, #EFE6FA 0%, rgba(239,230,250,0) 70%)" }} />
+      {children}
+    </div>
+  );
+}
+
+function LoadingScreen({ label = "Đang tải..." }) {
+  return (
+    <AuthBackdrop>
+      <div className="relative z-10 flex flex-col items-center gap-3">
+        <Flower size={34} petal={PRIMARY} center={SECONDARY} rotate={0} />
+        <p className="text-sm" style={{ color: MUTED, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{label}</p>
+      </div>
+    </AuthBackdrop>
+  );
+}
+
+function AuthScreen({ notify }) {
+  const [mode, setMode] = useState("signin"); // "signin" | "signup"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const switchMode = (m) => { setMode(m); setError(""); };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    if (!email.trim() || !password) { setError("Vui lòng nhập đầy đủ email và mật khẩu."); return; }
+    setBusy(true);
+    try {
+      if (mode === "signin") {
+        await auth.signInWithEmailAndPassword(email.trim(), password);
+      } else {
+        await auth.createUserWithEmailAndPassword(email.trim(), password);
+      }
+    } catch (err) {
+      setError(mapAuthError(err.code));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleGoogle = async () => {
+    setError("");
+    setBusy(true);
+    try {
+      await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider());
+    } catch (err) {
+      setError(mapAuthError(err.code));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleForgot = async () => {
+    setError("");
+    if (!email.trim()) { setError("Nhập email của bạn vào ô bên trên trước, rồi bấm lại \"Quên mật khẩu?\"."); return; }
+    try {
+      await auth.sendPasswordResetEmail(email.trim());
+      notify("Đã gửi email đặt lại mật khẩu, hãy kiểm tra hộp thư.", "success");
+    } catch (err) {
+      setError(mapAuthError(err.code));
+    }
+  };
+
+  return (
+    <AuthBackdrop>
+      <div className="relative z-10 w-full max-w-sm rounded-3xl border p-6 shadow-sm" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <div className="mb-5 flex flex-col items-center gap-1 text-center">
+          <Flower size={34} petal={PRIMARY} center={SECONDARY} />
+          <h1 className="text-2xl font-extrabold" style={{ fontFamily: "'Baloo 2', system-ui, sans-serif", color: PRIMARY, letterSpacing: "0.5px" }}>TNTime</h1>
+          <p className="text-xs" style={{ color: MUTED }}>{mode === "signin" ? "Đăng nhập để tiếp tục" : "Tạo tài khoản mới"}</p>
+        </div>
+
+        <div className="mb-4 flex gap-1 rounded-full border p-1" style={{ borderColor: BORDER }}>
+          <button type="button" onClick={() => switchMode("signin")} className="flex-1 rounded-full py-1.5 text-xs font-semibold transition-colors" style={{ backgroundColor: mode === "signin" ? PRIMARY : "transparent", color: mode === "signin" ? "#FFFFFF" : "#8A6070", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>Đăng nhập</button>
+          <button type="button" onClick={() => switchMode("signup")} className="flex-1 rounded-full py-1.5 text-xs font-semibold transition-colors" style={{ backgroundColor: mode === "signup" ? PRIMARY : "transparent", color: mode === "signup" ? "#FFFFFF" : "#8A6070", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>Đăng ký</button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-3">
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Email</label>
+            <input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full rounded-xl border px-3 py-2 text-sm outline-none focus:ring-2" style={{ borderColor: BORDER, color: INK }} placeholder="ban@gmail.com" />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Mật khẩu</label>
+            <input type="password" autoComplete={mode === "signin" ? "current-password" : "new-password"} value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleSubmit(e); }} className="w-full rounded-xl border px-3 py-2 text-sm outline-none focus:ring-2" style={{ borderColor: BORDER, color: INK }} placeholder="Tối thiểu 6 ký tự" />
+          </div>
+          {error && (
+            <p className="flex items-center gap-1.5 text-xs" style={{ color: DANGER }}><AlertTriangle size={13} />{error}</p>
+          )}
+          <button type="submit" disabled={busy} className="flex w-full items-center justify-center gap-1.5 rounded-full py-2 text-sm font-semibold text-white disabled:opacity-60" style={{ backgroundColor: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
+            {busy ? "Đang xử lý..." : mode === "signin" ? "Đăng nhập" : "Tạo tài khoản"}
+          </button>
+        </form>
+
+        {mode === "signin" && (
+          <button type="button" onClick={handleForgot} className="mt-2 w-full text-center text-[11px] hover:underline" style={{ color: MUTED }}>Quên mật khẩu?</button>
+        )}
+
+        <div className="my-4 flex items-center gap-2">
+          <div className="h-px flex-1" style={{ backgroundColor: BORDER }} />
+          <span className="text-[11px]" style={{ color: MUTED_LIGHT }}>hoặc</span>
+          <div className="h-px flex-1" style={{ backgroundColor: BORDER }} />
+        </div>
+
+        <button type="button" onClick={handleGoogle} disabled={busy} className="flex w-full items-center justify-center gap-2 rounded-full border py-2 text-sm font-medium disabled:opacity-60" style={{ borderColor: BORDER, color: INK, backgroundColor: "#FFFFFF" }}>
+          <GoogleGlyph /> Đăng nhập bằng Google
+        </button>
+      </div>
+    </AuthBackdrop>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  App shell                                                             */
+/* ---------------------------------------------------------------------- */
+
+const TABS = [
+  { id: "dashboard", label: "Tổng quan", icon: LayoutGrid },
+  { id: "slots", label: "Khung giờ rảnh", icon: Clock3 },
+  { id: "assistant", label: "Trợ lý sắp xếp", icon: Sparkles },
+];
+
+function App() {
+  const [user, setUser] = useState(undefined); // undefined = đang kiểm tra, null = chưa đăng nhập
+  const [view, setView] = useState("dashboard");
+  const [freeSlots, setFreeSlots] = useState({});
+  const [tasks, setTasks] = useState([]);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [toast, setToast] = useState(null);
+  const [justSaved, setJustSaved] = useState(false);
+  const skipNextSave = useRef(false);
+  const saveTimer = useRef(null);
+
+  const notify = useCallback((message, type = "success") => setToast({ message, type, id: uid() }), []);
+
+  useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 3200); return () => clearTimeout(t); }, [toast]);
+
+  /* Theo dõi trạng thái đăng nhập */
+  useEffect(() => {
+    const unsub = auth.onAuthStateChanged((u) => setUser(u));
+    return () => unsub();
+  }, []);
+
+  /* Khi có người dùng đăng nhập: tải dữ liệu của họ từ Firestore.
+     Nếu là lần đầu (chưa có tài liệu trên Firestore), dùng tạm dữ liệu
+     localStorage cũ trên trình duyệt này (nếu có) làm dữ liệu khởi đầu,
+     để không mất dữ liệu đã nhập trước khi có tính năng đăng nhập. */
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    setDataLoading(true);
+    const ref = db.collection("users").doc(user.uid);
+    ref.get().then((snap) => {
+      if (cancelled) return;
+      if (snap.exists) {
+        const data = snap.data() || {};
+        skipNextSave.current = true;
+        setFreeSlots(data.freeSlots || {});
+        setTasks(data.tasks || []);
+      } else {
+        const initFree = loadLS(LS_FREE, null) || seedDefaultFreeSlots();
+        const initTasks = loadLS(LS_TASKS, null) || [];
+        skipNextSave.current = true;
+        setFreeSlots(initFree);
+        setTasks(initTasks);
+        ref.set({
+          freeSlots: initFree,
+          tasks: initTasks,
+          email: user.email || null,
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+      }
+      setDataLoading(false);
+    }).catch(() => {
+      if (cancelled) return;
+      notify("Không tải được dữ liệu từ máy chủ, hãy thử tải lại trang.", "error");
+      setDataLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [user]);
+
+  /* Lưu lên Firestore mỗi khi dữ liệu thay đổi (gộp các thay đổi liên tiếp
+     trong ~600ms để tránh ghi quá nhiều lần). */
+  useEffect(() => {
+    if (!user || dataLoading) return;
+    if (skipNextSave.current) { skipNextSave.current = false; return; }
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      db.collection("users").doc(user.uid).set({
+        freeSlots, tasks,
+        email: user.email || null,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true }).then(() => {
+        setJustSaved(true);
+        setTimeout(() => setJustSaved(false), 900);
+      }).catch(() => notify("Lưu dữ liệu thất bại, kiểm tra kết nối mạng.", "error"));
+    }, 600);
+    return () => clearTimeout(saveTimer.current);
+  }, [freeSlots, tasks, user, dataLoading]);
+
+  const handleLogout = async () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    await auth.signOut();
+    setFreeSlots({});
+    setTasks([]);
+    setDataLoading(true);
+  };
+
+  const handleDropTask = (taskId, day, hour) => {
+    if (!taskId) return;
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) return;
+    const occupied = buildOccupied(tasks, task.id);
+    if (hour + task.duration - 1 > HOUR_END || !canPlace(freeSlots, occupied, day, hour, task.duration, task.id)) {
+      notify("Không thể đặt vào đây — trùng lịch hoặc ngoài khung giờ rảnh.", "error");
+      return;
+    }
+    setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: "scheduled", scheduledDay: day, scheduledStart: hour } : t)));
+  };
+
+  const resetAllData = () => {
+    if (!window.confirm("Xoá toàn bộ dữ liệu đã lưu (khung giờ rảnh + việc cần làm)?")) return;
+    setFreeSlots({});
+    setTasks([]);
+    notify("Đã xoá toàn bộ dữ liệu.", "success");
+  };
+
+  if (user === undefined) return <LoadingScreen label="Đang kiểm tra đăng nhập..." />;
+  if (user === null) return <AuthScreen notify={notify} />;
+  if (dataLoading) return <LoadingScreen label="Đang tải dữ liệu của bạn..." />;
+
+  return (
+    <div className="relative min-h-screen w-full" style={{ backgroundColor: "#FFF6FA", fontFamily: "'Inter', system-ui, sans-serif" }}>
+      {/* soft decorative background blobs */}
+      <div className="bg-blob" style={{ width: 320, height: 320, top: -120, left: -100, background: "radial-gradient(circle, #FDE3EE 0%, rgba(253,227,238,0) 70%)" }} />
+      <div className="bg-blob" style={{ width: 280, height: 280, bottom: -100, right: -80, background: "radial-gradient(circle, #FFF1D6 0%, rgba(255,241,214,0) 70%)" }} />
+      <div className="bg-blob" style={{ width: 220, height: 220, top: "40%", right: -110, background: "radial-gradient(circle, #EFE6FA 0%, rgba(239,230,250,0) 70%)" }} />
+
+      <header className="relative overflow-hidden border-b" style={{ borderColor: BORDER, background: "linear-gradient(180deg, #FDEDF4 0%, #FFF6FA 100%)" }}>
+        <Cloud size={110} color="#FFFFFF" opacity={0.9} className="float-slow" style={{ position: "absolute", top: 10, left: 18 }} />
+        <Cloud size={70} color="#FFFFFF" opacity={0.8} className="float-slower" style={{ position: "absolute", top: 30, left: 130 }} />
+        <Rainbow size={130} opacity={0.85} style={{ position: "absolute", top: -10, right: 24 }} />
+
+        <div className="relative z-10 mx-auto flex max-w-5xl flex-col gap-4 px-5 py-6 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h1 className="text-3xl font-extrabold" style={{ fontFamily: "'Baloo 2', system-ui, sans-serif", color: PRIMARY, letterSpacing: "0.5px" }}>TNTime</h1>
+            <p className="flex flex-wrap items-center gap-1.5 text-xs" style={{ color: "#9C6B80" }}>
+              Tự động tối ưu thời gian trống trong tuần
+              <span className="flex items-center gap-1" style={{ color: justSaved ? PRIMARY : "#E3B9CB", transition: "color .3s" }}>
+                <Save size={11} /> {justSaved ? "đã lưu" : "tự động lưu"}
+              </span>
+              {user?.email && <span style={{ color: MUTED_LIGHT }}>· {user.email}</span>}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <nav className="flex gap-1 rounded-full border p-1" style={{ borderColor: BORDER, backgroundColor: "#FFFFFF" }}>
+              {TABS.map((t) => {
+                const active = view === t.id;
+                const Icon = t.icon;
+                return (
+                  <button key={t.id} onClick={() => setView(t.id)} className="flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors" style={{ backgroundColor: active ? PRIMARY : "transparent", color: active ? "#FFFFFF" : "#8A6070", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
+                    <Icon size={14} />{t.label}
+                  </button>
+                );
+              })}
+            </nav>
+            <button onClick={resetAllData} title="Xoá toàn bộ dữ liệu đã lưu" className="rounded-full border p-2 hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: MUTED_LIGHT, backgroundColor: "#FFFFFF" }}>
+              <RotateCcw size={15} />
+            </button>
+            <button onClick={handleLogout} title="Đăng xuất" className="rounded-full border p-2 hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: MUTED_LIGHT, backgroundColor: "#FFFFFF" }}>
+              <XIcon size={15} />
+            </button>
+          </div>
+        </div>
+        <FlowerDivider />
+      </header>
+
+      <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
+        {view === "dashboard" && <DashboardView freeSlots={freeSlots} tasks={tasks} onDropTask={handleDropTask} />}
+        {view === "slots" && <SlotEditorView freeSlots={freeSlots} setFreeSlots={setFreeSlots} />}
+        {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} freeSlots={freeSlots} notify={notify} />}
+      </main>
+
+      <Toast toast={toast} onClose={() => setToast(null)} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
