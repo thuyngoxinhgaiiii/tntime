@@ -843,7 +843,15 @@ function SlotEditorView({ busySlots, setBusySlots, notify }) {
             <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ bận</p>
             <p className="text-xs" style={{ color: MUTED }}>Kéo chuột trên lịch để chọn chính xác tới 5 phút · kéo mép trên/dưới của khối đã có để chỉnh lại · khung giờ chưa đánh dấu mặc định là rảnh · {formatDuration(totalFreeMin)} rảnh / tuần</p>
           </div>
-          <button onClick={() => { setBusySlots({}); setEditing(null); }} className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
+          <button
+            onClick={() => {
+              if (!window.confirm("Xoá TOÀN BỘ khung giờ bận đã đánh dấu? Hành động này không thể hoàn tác.")) return;
+              setBusySlots({});
+              setEditing(null);
+            }}
+            className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF1F1]"
+            style={{ borderColor: "#F5C6C6", color: DANGER }}
+          >
             <RotateCcw size={13} /> Xoá tất cả
           </button>
         </div>
@@ -1631,7 +1639,12 @@ function AuthScreen({ notify }) {
     setError("");
     setBusy(true);
     try {
-      await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider());
+      const provider = new firebase.auth.GoogleAuthProvider();
+      // Luôn hiện màn hình chọn tài khoản Google, để tránh đăng nhập nhầm
+      // sang một tài khoản Gmail khác (gây cảm giác "mất dữ liệu" vì mỗi
+      // tài khoản Google có kho lịch riêng trên máy chủ).
+      provider.setCustomParameters({ prompt: "select_account" });
+      await auth.signInWithPopup(provider);
     } catch (err) {
       setError(mapAuthError(err.code));
     } finally {
@@ -1778,6 +1791,12 @@ function App() {
           email: user.email || null,
           updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
         }).catch(() => {});
+        // Tài khoản này chưa từng có dữ liệu trên máy chủ. Nếu người dùng
+        // nghĩ mình đã từng nhập lịch trước đó, rất có thể họ vừa đăng nhập
+        // nhầm sang một tài khoản Google khác (nhiều Gmail trên cùng máy).
+        if (!rawInitFree && initTasks.length === 0) {
+          notify(`Tài khoản ${user.email || ""} chưa có dữ liệu nào. Nếu bạn từng nhập lịch trước đó, hãy đăng xuất và đăng nhập lại đúng tài khoản Google bạn đã dùng lần đầu.`, "error");
+        }
       }
       setDataLoading(false);
     }).catch(() => {
@@ -1846,7 +1865,8 @@ function App() {
   };
 
   const resetAllData = () => {
-    if (!window.confirm("Xoá toàn bộ dữ liệu đã lưu (khung giờ bận + việc cần làm)?")) return;
+    const emailHint = user?.email ? ` của tài khoản ${user.email}` : "";
+    if (!window.confirm(`XOÁ VĨNH VIỄN toàn bộ dữ liệu đã lưu${emailHint} (khung giờ bận + việc cần làm)?\n\nHành động này KHÔNG THỂ hoàn tác. Bấm OK chỉ khi bạn chắc chắn muốn xoá sạch.`)) return;
     setBusySlots({});
     setTasks([]);
     notify("Đã xoá toàn bộ dữ liệu.", "success");
@@ -1891,11 +1911,12 @@ function App() {
                 );
               })}
             </nav>
-            <button onClick={resetAllData} title="Xoá toàn bộ dữ liệu đã lưu" className="rounded-full border p-2 hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: MUTED_LIGHT, backgroundColor: "#FFFFFF" }}>
-              <RotateCcw size={15} />
+            <button onClick={resetAllData} title="Xoá toàn bộ dữ liệu đã lưu (không thể hoàn tác)" className="flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF1F1]" style={{ borderColor: "#F5C6C6", color: DANGER, backgroundColor: "#FFFFFF" }}>
+              <RotateCcw size={14} /> Xoá dữ liệu
             </button>
-            <button onClick={handleLogout} title="Đăng xuất" className="rounded-full border p-2 hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: MUTED_LIGHT, backgroundColor: "#FFFFFF" }}>
-              <XIcon size={15} />
+            <span style={{ width: 10 }} />
+            <button onClick={handleLogout} title="Đăng xuất" className="flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070", backgroundColor: "#FFFFFF" }}>
+              <XIcon size={14} /> Đăng xuất
             </button>
           </div>
         </div>
