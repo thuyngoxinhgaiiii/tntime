@@ -92,6 +92,8 @@ const PenSquare = makeIcon(<><path d="M11 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a
 const RotateCcw = makeIcon(<><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></>);
 const CheckCircle2 = makeIcon(<><circle cx="12" cy="12" r="9" /><path d="M8.5 12.5l2.3 2.3L16 10" /></>);
 const Save = makeIcon(<><path d="M5 4h11l3 3v13H5V4z" /><path d="M8 4v5h7V4" /><path d="M8 14h8v6H8z" /></>);
+const Users2 = makeIcon(<><circle cx="9" cy="8" r="3.2" /><path d="M3.5 19c0-3 2.5-5 5.5-5s5.5 2 5.5 5" /><circle cx="17" cy="8.5" r="2.4" /><path d="M15.2 14.2c2.4.3 4.3 2.1 4.3 4.8" /></>);
+const Mail = makeIcon(<><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M3 7l9 6 9-6" /></>);
 
 /* ---------------------------------------------------------------------- */
 /*  Original decorative motifs — clouds, rainbow, flowers (hand-drawn     */
@@ -446,6 +448,16 @@ function autoSchedule(tasks, busySlots) {
     if (!placed) results[t.id] = { scheduledDay: null, scheduledStart: null, status: "unscheduled" };
   });
   return results;
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Trung tâm (nhiều giáo viên) — helpers                                 */
+/*  Dùng lại cấu trúc { [day]: [{ id, s, e, ... }] } giống busySlots, nên  */
+/*  tái sử dụng được isRangeFreeOfBusy / updateBusyBlock / removeBusyBlock */
+/* ---------------------------------------------------------------------- */
+
+function totalAssignedMinutes(assignmentsByDay) {
+  return DAYS.reduce((sum, _d, di) => sum + ((assignmentsByDay[di] || []).reduce((s, a) => s + (a.e - a.s), 0)), 0);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1111,6 +1123,482 @@ function LoadingScreen({ label = "Đang tải..." }) {
   );
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Trung tâm — chủ trung tâm xếp lớp cho nhiều giáo viên                  */
+/*  Dữ liệu lịch cá nhân của mỗi giáo viên KHÔNG đổi (vẫn ở users/{uid}).  */
+/*  Thêm collection centers/{id} + members/{uid} + invites + assignments. */
+/* ---------------------------------------------------------------------- */
+
+function AssignmentGrid({ busySlots, assignments, onCreateDraft, onSelectAssignment }) {
+  const rowH = 26;
+  const labelW = 46;
+  const pxPerMin = rowH / 60;
+  const totalHeight = HOURS.length * rowH;
+  const dragRef = useRef(null);
+  const draftValueRef = useRef(null);
+  const [draft, setDraft] = useState(null);
+
+  const minuteAtY = (y) => {
+    const raw = DAY_START_MIN + y / pxPerMin;
+    return Math.min(DAY_END_MIN, Math.max(DAY_START_MIN, roundToStep(raw)));
+  };
+
+  const handleMouseDown = (day) => (e) => {
+    if (e.target !== e.currentTarget) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const m = minuteAtY(e.clientY - rect.top);
+    dragRef.current = { day, startMin: m, top: rect.top };
+    const next = { day, s: m, e: m };
+    draftValueRef.current = next;
+    setDraft(next);
+  };
+
+  useEffect(() => {
+    const handleMove = (e) => {
+      if (!dragRef.current) return;
+      const { day, startMin, top } = dragRef.current;
+      const m = minuteAtY(e.clientY - top);
+      const next = { day, s: Math.min(startMin, m), e: Math.max(startMin, m) };
+      draftValueRef.current = next;
+      setDraft(next);
+    };
+    const handleUp = () => {
+      if (!dragRef.current) return;
+      dragRef.current = null;
+      const d = draftValueRef.current;
+      draftValueRef.current = null;
+      setDraft(null);
+      if (d && d.e - d.s >= TIME_STEP_MIN) onCreateDraft(d.day, d.s, d.e);
+    };
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [onCreateDraft]);
+
+  return (
+    <div className="overflow-x-auto">
+      <div className="flex select-none" style={{ minWidth: 560 }}>
+        <div style={{ width: labelW, flexShrink: 0 }}>
+          <div style={{ height: 20 }} />
+          <div style={{ position: "relative", height: totalHeight }}>
+            {HOURS.map((h) => (
+              <div key={h} style={{ position: "absolute", top: (h - HOUR_START) * rowH - 6, right: 4, fontSize: 9.5, color: MUTED_LIGHT }}>{h}:00</div>
+            ))}
+          </div>
+        </div>
+        {DAYS.map((d, di) => (
+          <div key={d.short} style={{ flex: 1, minWidth: 56 }}>
+            <div className="flex items-end justify-center pb-1 text-[10.5px] font-semibold" style={{ height: 20, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
+            <div
+              className="daycol"
+              onMouseDown={handleMouseDown(di)}
+              style={{
+                position: "relative", height: totalHeight, cursor: "crosshair",
+                backgroundColor: "#FFFCFD",
+                backgroundImage: `repeating-linear-gradient(to bottom, #FBEAF1 0, #FBEAF1 1px, transparent 1px, transparent ${rowH}px)`,
+                borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7",
+                borderRight: "1px solid #FDF3F7",
+              }}
+            >
+              {(busySlots[di] || []).map((b) => (
+                <div key={"busy-" + b.id} style={{ position: "absolute", left: 1, right: 1, top: (b.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (b.e - b.s) * pxPerMin), backgroundColor: "#FBD9E7", opacity: 0.65, borderRadius: 4, pointerEvents: "none" }} title="Khung giờ bận cá nhân" />
+              ))}
+              {(assignments[di] || []).map((a) => (
+                <div
+                  key={a.id}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); onSelectAssignment(di, a); }}
+                  title={a.className || "Lớp học"}
+                  className="absolute left-0.5 right-0.5 cursor-pointer overflow-hidden rounded-md border px-1 py-0.5 text-[9.5px] leading-tight hover:brightness-95"
+                  style={{ top: (a.s - DAY_START_MIN) * pxPerMin, height: Math.max(8, (a.e - a.s) * pxPerMin), backgroundColor: "#FFE7CC", borderColor: "#FFA94D", color: "#8A5A12", zIndex: 2 }}
+                >
+                  <span className="font-semibold">{minToHHMM(a.s)}–{minToHHMM(a.e)}</span>
+                  {a.className && <div className="truncate opacity-90">{a.className}</div>}
+                </div>
+              ))}
+              {draft && draft.day === di && (
+                <div className="absolute left-0.5 right-0.5 rounded-md border-2 border-dashed" style={{ top: (draft.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (draft.e - draft.s) * pxPerMin), borderColor: "#FFA94D", backgroundColor: "#FFE7CC99" }} />
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AssignmentEditForm({ editing, setEditing, centerId, teacherUid, busySlots, assignments, notify }) {
+  const [className, setClassName] = useState(editing.className || "");
+  const [sVal, setSVal] = useState(minToHHMM(editing.s));
+  const [eVal, setEVal] = useState(minToHHMM(editing.e));
+
+  useEffect(() => {
+    setClassName(editing.className || "");
+    setSVal(minToHHMM(editing.s));
+    setEVal(minToHHMM(editing.e));
+  }, [editing.id]);
+
+  const handleSave = async () => {
+    const s = roundToStep(hhmmToMin(sVal));
+    const e = roundToStep(hhmmToMin(eVal));
+    const [cs, ce] = clampRange(s, e);
+    if (ce <= cs) { notify("Giờ kết thúc phải sau giờ bắt đầu.", "error"); return; }
+    if (!isRangeFreeOfBusy(busySlots, editing.day, cs, ce)) { notify("Trùng với khung giờ bận cá nhân của giáo viên.", "error"); return; }
+    if (!isRangeFreeOfBusy(assignments, editing.day, cs, ce, editing.id)) { notify("Trùng với 1 lớp khác đã xếp cho giáo viên này.", "error"); return; }
+    try {
+      await db.collection("centers").doc(centerId).collection("assignments").doc(editing.id).set({
+        teacherUid, day: editing.day, s: cs, e: ce, className: className.trim(),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      setEditing(null);
+    } catch (err) {
+      notify("Lưu thất bại, thử lại nhé.", "error");
+    }
+  };
+
+  const handleDelete = async () => {
+    await db.collection("centers").doc(centerId).collection("assignments").doc(editing.id).delete().catch(() => {});
+    setEditing(null);
+  };
+
+  const handleCancel = async () => {
+    if (editing.isDraft) {
+      await db.collection("centers").doc(centerId).collection("assignments").doc(editing.id).delete().catch(() => {});
+    }
+    setEditing(null);
+  };
+
+  return (
+    <div className="mt-3 rounded-xl border p-3" style={{ borderColor: BORDER, backgroundColor: "#FFFCF7" }}>
+      <p className="mb-2 text-xs font-medium" style={{ color: INK }}>{editing.isDraft ? "Xếp lớp mới" : "Sửa lớp đã xếp"} — {DAYS[editing.day].full}</p>
+      <div className="mb-2 grid grid-cols-2 gap-2">
+        <div>
+          <label className="mb-1 block text-[11px]" style={{ color: MUTED }}>Bắt đầu</label>
+          <input type="time" step="300" value={sVal} onChange={(e) => setSVal(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        </div>
+        <div>
+          <label className="mb-1 block text-[11px]" style={{ color: MUTED }}>Kết thúc</label>
+          <input type="time" step="300" value={eVal} onChange={(e) => setEVal(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        </div>
+      </div>
+      <div className="mb-3">
+        <label className="mb-1 block text-[11px]" style={{ color: MUTED }}>Tên lớp / ghi chú</label>
+        <input type="text" value={className} onChange={(e) => setClassName(e.target.value)} placeholder="VD: HSK3 — Lớp tối thứ 4" className="w-full rounded-lg border px-2 py-1.5 text-sm" style={{ borderColor: BORDER, color: INK }} />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={handleSave} className="rounded-full px-3 py-1.5 text-xs font-semibold text-white" style={{ backgroundColor: "#FFA94D" }}>Lưu</button>
+        <button onClick={handleDelete} className="rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: DANGER }}>Xoá</button>
+        <button onClick={handleCancel} className="rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>Huỷ</button>
+      </div>
+    </div>
+  );
+}
+
+function TeacherCard({ centerId, teacher, assignmentsForTeacher, notify }) {
+  const [editingA, setEditingA] = useState(null);
+  const freeMin = totalFreeMinutes(teacher.busySlots || {});
+  const assignedMin = totalAssignedMinutes(assignmentsForTeacher || {});
+
+  const handleCreateDraft = useCallback((day, s, e) => {
+    const [cs, ce] = clampRange(s, e);
+    if (ce <= cs) return;
+    if (!isRangeFreeOfBusy(teacher.busySlots || {}, day, cs, ce)) {
+      notify("Khung giờ này trùng với giờ bận cá nhân của giáo viên.", "error");
+      return;
+    }
+    if (!isRangeFreeOfBusy(assignmentsForTeacher || {}, day, cs, ce)) {
+      notify("Khung giờ này trùng với 1 lớp khác đã xếp cho giáo viên.", "error");
+      return;
+    }
+    const newId = uid();
+    db.collection("centers").doc(centerId).collection("assignments").doc(newId).set({
+      teacherUid: teacher.uid, day, s: cs, e: ce, className: "",
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }).catch(() => notify("Không xếp được lớp, thử lại nhé.", "error"));
+    setEditingA({ day, id: newId, s: cs, e: ce, className: "", isDraft: true });
+  }, [teacher, assignmentsForTeacher, centerId, notify]);
+
+  const handleSelectAssignment = useCallback((day, block) => {
+    setEditingA({ day, id: block.id, s: block.s, e: block.e, className: block.className || "" });
+  }, []);
+
+  return (
+    <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{teacher.email || "Giáo viên"}</p>
+          <p className="text-xs" style={{ color: MUTED }}>{formatDuration(freeMin)} rảnh/tuần · {formatDuration(assignedMin)} đã xếp lớp</p>
+        </div>
+      </div>
+      <AssignmentGrid busySlots={teacher.busySlots || {}} assignments={assignmentsForTeacher || {}} onCreateDraft={handleCreateDraft} onSelectAssignment={handleSelectAssignment} />
+      {editingA && (
+        <AssignmentEditForm
+          editing={editingA}
+          setEditing={setEditingA}
+          centerId={centerId}
+          teacherUid={teacher.uid}
+          busySlots={teacher.busySlots || {}}
+          assignments={assignmentsForTeacher || {}}
+          notify={notify}
+        />
+      )}
+      <p className="mt-2 text-[11px]" style={{ color: MUTED_LIGHT }}>Kéo chuột trên lịch để xếp lớp vào khung giờ trống · bấm vào 1 lớp đã xếp để sửa/xoá.</p>
+    </div>
+  );
+}
+
+function InviteForm({ centerId, centerName, notify }) {
+  const [email, setEmail] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const handleInvite = async () => {
+    const normalized = email.trim().toLowerCase();
+    if (!normalized || !normalized.includes("@")) { notify("Nhập email hợp lệ của giáo viên.", "error"); return; }
+    setBusy(true);
+    try {
+      await db.collection("centers").doc(centerId).collection("invites").add({
+        email: normalized, centerName: centerName || "", status: "pending",
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setEmail("");
+      notify("Đã gửi lời mời — giáo viên sẽ thấy khi họ đăng nhập vào TNTime.", "success");
+    } catch (err) {
+      notify("Không gửi được lời mời, thử lại nhé.", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleInvite(); }} placeholder="email-giao-vien@gmail.com" className="flex-1 min-w-[200px] rounded-full border px-3 py-2 text-sm" style={{ borderColor: BORDER, color: INK }} />
+      <button onClick={handleInvite} disabled={busy} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-xs font-semibold text-white disabled:opacity-60" style={{ backgroundColor: PRIMARY }}>
+        <Mail size={13} /> Mời giáo viên
+      </button>
+    </div>
+  );
+}
+
+function OwnerInvitesList({ centerId, invites }) {
+  if (!invites.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      {invites.map((inv) => (
+        <span key={inv.id} className="flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs" style={{ borderColor: BORDER, color: MUTED, backgroundColor: "#FFFCF7" }}>
+          {inv.email} · đang chờ
+          <button onClick={() => db.collection("centers").doc(centerId).collection("invites").doc(inv.id).delete().catch(() => {})} title="Huỷ lời mời" style={{ color: MUTED_LIGHT }}>
+            <XIcon size={11} />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function CenterOwnerDashboard({ ownedCenterId, notify }) {
+  const [center, setCenter] = useState(null);
+  const [members, setMembers] = useState([]);
+  const [assignmentsByTeacher, setAssignmentsByTeacher] = useState({});
+  const [invites, setInvites] = useState([]);
+
+  useEffect(() => {
+    const unsub1 = db.collection("centers").doc(ownedCenterId).onSnapshot((snap) => setCenter(snap.exists ? { id: snap.id, ...snap.data() } : null));
+    const unsub2 = db.collection("centers").doc(ownedCenterId).collection("members").onSnapshot((snap) => {
+      setMembers(snap.docs.map((d) => ({ uid: d.id, ...d.data() })).filter((m) => m.role !== "owner"));
+    }, () => {});
+    const unsub3 = db.collection("centers").doc(ownedCenterId).collection("assignments").onSnapshot((snap) => {
+      const byTeacher = {};
+      snap.docs.forEach((d) => {
+        const a = { id: d.id, ...d.data() };
+        byTeacher[a.teacherUid] = byTeacher[a.teacherUid] || {};
+        byTeacher[a.teacherUid][a.day] = byTeacher[a.teacherUid][a.day] || [];
+        byTeacher[a.teacherUid][a.day].push(a);
+      });
+      setAssignmentsByTeacher(byTeacher);
+    }, () => {});
+    const unsub4 = db.collection("centers").doc(ownedCenterId).collection("invites").onSnapshot((snap) => {
+      setInvites(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    }, () => {});
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+  }, [ownedCenterId]);
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <div className="mb-3">
+          <p className="text-sm font-medium" style={{ color: INK }}>{center?.name || "Trung tâm của bạn"}</p>
+          <p className="text-xs" style={{ color: MUTED }}>{members.length} giáo viên đã tham gia</p>
+        </div>
+        <InviteForm centerId={ownedCenterId} centerName={center?.name} notify={notify} />
+        <div className="mt-2"><OwnerInvitesList centerId={ownedCenterId} invites={invites} /></div>
+      </div>
+
+      {members.length === 0 && (
+        <p className="rounded-2xl border p-4 text-center text-xs" style={{ borderColor: BORDER, color: MUTED, backgroundColor: CARD }}>
+          Chưa có giáo viên nào tham gia. Mời bằng email ở trên — giáo viên sẽ thấy lời mời khi họ đăng nhập vào TNTime.
+        </p>
+      )}
+
+      {members.map((m) => (
+        <TeacherCard key={m.uid} centerId={ownedCenterId} teacher={m} assignmentsForTeacher={assignmentsByTeacher[m.uid] || {}} notify={notify} />
+      ))}
+    </div>
+  );
+}
+
+function CreateCenterCard({ user, setOwnedCenterId, notify }) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const handleCreate = async () => {
+    if (!name.trim()) { notify("Nhập tên trung tâm trước đã.", "error"); return; }
+    setBusy(true);
+    try {
+      const ref = db.collection("centers").doc();
+      await ref.set({ name: name.trim(), ownerId: user.uid, ownerEmail: user.email || null, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+      await db.collection("users").doc(user.uid).set({ ownedCenterId: ref.id }, { merge: true });
+      setOwnedCenterId(ref.id);
+      notify("Đã tạo trung tâm — giờ bạn có thể mời giáo viên.", "success");
+    } catch (err) {
+      notify("Không tạo được trung tâm, thử lại nhé.", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-2xl border p-5 text-center" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <Users2 size={28} style={{ color: PRIMARY, margin: "0 auto 8px" }} />
+      <p className="mb-1 text-sm font-medium" style={{ color: INK }}>Bạn là chủ trung tâm?</p>
+      <p className="mb-3 text-xs" style={{ color: MUTED }}>Tạo trung tâm để mời giáo viên tham gia, xem lịch rảnh của từng người và xếp lớp trực tiếp trên lịch của họ.</p>
+      <div className="mx-auto flex max-w-xs gap-2">
+        <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleCreate(); }} placeholder="Tên trung tâm" className="flex-1 rounded-full border px-3 py-2 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        <button onClick={handleCreate} disabled={busy} className="rounded-full px-4 py-2 text-xs font-semibold text-white disabled:opacity-60" style={{ backgroundColor: PRIMARY }}>{busy ? "..." : "Tạo"}</button>
+      </div>
+    </div>
+  );
+}
+
+function usePendingInvites(userEmail) {
+  const [invites, setInvites] = useState([]);
+  useEffect(() => {
+    if (!userEmail) { setInvites([]); return; }
+    const unsub = db.collectionGroup("invites").where("email", "==", userEmail).onSnapshot((snap) => {
+      setInvites(snap.docs.map((d) => ({ id: d.id, centerId: d.ref.parent.parent.id, ...d.data() })));
+    }, () => {});
+    return () => unsub();
+  }, [userEmail]);
+  return invites;
+}
+
+function PendingInviteCard({ invite, onAccept, onDecline }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="flex items-center gap-2">
+        <Mail size={16} style={{ color: PRIMARY }} />
+        <p className="text-sm" style={{ color: INK }}>Lời mời tham gia trung tâm <strong>{invite.centerName || "..."}</strong></p>
+      </div>
+      <div className="flex gap-2">
+        <button disabled={busy} onClick={async () => { setBusy(true); await onAccept(invite); setBusy(false); }} className="rounded-full px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60" style={{ backgroundColor: PRIMARY }}>Tham gia</button>
+        <button disabled={busy} onClick={async () => { setBusy(true); await onDecline(invite); setBusy(false); }} className="rounded-full border px-3 py-1.5 text-xs font-medium disabled:opacity-60 hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>Từ chối</button>
+      </div>
+    </div>
+  );
+}
+
+function TeacherCenterCard({ centerId, user }) {
+  const [center, setCenter] = useState(null);
+  const [assignments, setAssignments] = useState({});
+
+  useEffect(() => {
+    const unsub1 = db.collection("centers").doc(centerId).onSnapshot((snap) => setCenter(snap.exists ? { id: snap.id, ...snap.data() } : null));
+    const unsub2 = db.collection("centers").doc(centerId).collection("assignments").where("teacherUid", "==", user.uid).onSnapshot((snap) => {
+      const byDay = {};
+      snap.docs.forEach((d) => {
+        const a = { id: d.id, ...d.data() };
+        byDay[a.day] = byDay[a.day] || [];
+        byDay[a.day].push(a);
+      });
+      Object.keys(byDay).forEach((d) => byDay[d].sort((x, y) => x.s - y.s));
+      setAssignments(byDay);
+    }, () => {});
+    return () => { unsub1(); unsub2(); };
+  }, [centerId, user.uid]);
+
+  const dayIdxWithClasses = DAYS.map((_d, di) => di).filter((di) => (assignments[di] || []).length);
+
+  return (
+    <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <p className="mb-2 text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{center?.name || "Trung tâm"}</p>
+      {dayIdxWithClasses.length === 0 ? (
+        <p className="text-xs" style={{ color: MUTED }}>Chưa có lớp nào được xếp cho bạn ở trung tâm này.</p>
+      ) : (
+        <div className="space-y-1.5">
+          {dayIdxWithClasses.map((di) => (
+            <div key={di} className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="w-9 shrink-0 font-semibold" style={{ color: PRIMARY }}>{DAYS[di].short}</span>
+              {(assignments[di] || []).map((a) => (
+                <span key={a.id} className="rounded-full border px-2.5 py-1" style={{ borderColor: "#FFA94D", backgroundColor: "#FFF6E9", color: "#8A5A12" }}>
+                  {minToHHMM(a.s)}–{minToHHMM(a.e)}{a.className ? ` · ${a.className}` : ""}
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCenterId, notify }) {
+  const pendingInvites = usePendingInvites(user.email);
+
+  const handleAccept = async (invite) => {
+    try {
+      await db.collection("centers").doc(invite.centerId).collection("members").doc(user.uid).set({
+        email: user.email || null, role: "teacher", status: "active",
+        joinedAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      await db.collection("users").doc(user.uid).set({ centerIds: firebase.firestore.FieldValue.arrayUnion(invite.centerId) }, { merge: true });
+      await db.collection("centers").doc(invite.centerId).collection("invites").doc(invite.id).delete().catch(() => {});
+      setCenterIds((prev) => (prev.includes(invite.centerId) ? prev : [...prev, invite.centerId]));
+      notify(`Đã tham gia trung tâm "${invite.centerName || ""}".`, "success");
+    } catch (err) {
+      notify("Không tham gia được, thử lại nhé.", "error");
+    }
+  };
+
+  const handleDecline = async (invite) => {
+    await db.collection("centers").doc(invite.centerId).collection("invites").doc(invite.id).delete().catch(() => {});
+  };
+
+  return (
+    <div className="space-y-4">
+      {pendingInvites.length > 0 && (
+        <div className="space-y-2">
+          {pendingInvites.map((inv) => (
+            <PendingInviteCard key={inv.centerId + inv.id} invite={inv} onAccept={handleAccept} onDecline={handleDecline} />
+          ))}
+        </div>
+      )}
+
+      {ownedCenterId && <CenterOwnerDashboard ownedCenterId={ownedCenterId} notify={notify} />}
+
+      {centerIds.length > 0 && (
+        <div className="space-y-3">
+          {centerIds.map((cid) => <TeacherCenterCard key={cid} centerId={cid} user={user} />)}
+        </div>
+      )}
+
+      {!ownedCenterId && <CreateCenterCard user={user} setOwnedCenterId={setOwnedCenterId} notify={notify} />}
+    </div>
+  );
+}
+
 function AuthScreen({ notify }) {
   const [mode, setMode] = useState("signin"); // "signin" | "signup"
   const [email, setEmail] = useState("");
@@ -1217,6 +1705,7 @@ function AuthScreen({ notify }) {
 const TABS = [
   { id: "dashboard", label: "Tổng quan", icon: LayoutGrid },
   { id: "slots", label: "Khung giờ bận", icon: Clock3 },
+  { id: "center", label: "Trung tâm", icon: Users2 },
   { id: "assistant", label: "Trợ lý sắp xếp", icon: Sparkles },
 ];
 
@@ -1225,6 +1714,10 @@ function App() {
   const [view, setView] = useState("dashboard");
   const [busySlots, setBusySlots] = useState({});
   const [tasks, setTasks] = useState([]);
+  // Trung tâm: centerIds = các trung tâm mình tham gia với vai trò giáo viên;
+  // ownedCenterId = trung tâm mình làm chủ (nếu có).
+  const [centerIds, setCenterIds] = useState([]);
+  const [ownedCenterId, setOwnedCenterId] = useState(null);
   const [dataLoading, setDataLoading] = useState(true);
   const [toast, setToast] = useState(null);
   const [justSaved, setJustSaved] = useState(false);
@@ -1254,6 +1747,8 @@ function App() {
       if (cancelled) return;
       if (snap.exists) {
         const data = snap.data() || {};
+        setCenterIds(Array.isArray(data.centerIds) ? data.centerIds : []);
+        setOwnedCenterId(data.ownedCenterId || null);
         if (data.busySlots) {
           const loadedBusy = normalizeLoadedBusySlots(data.busySlots);
           skipNextSave.current = true;
@@ -1311,9 +1806,27 @@ function App() {
     return () => clearTimeout(saveTimer.current);
   }, [busySlots, tasks, user, dataLoading]);
 
+  /* Đồng bộ khung giờ bận cá nhân vào từng trung tâm mình đang tham gia (với
+     vai trò giáo viên), để chủ trung tâm xem được lịch rảnh khi xếp lớp.
+     Không đụng gì tới users/{uid} — chỉ ghi thêm vào centers/{id}/members/{uid}. */
+  useEffect(() => {
+    if (!user || dataLoading || centerIds.length === 0) return;
+    const t = setTimeout(() => {
+      centerIds.forEach((cid) => {
+        db.collection("centers").doc(cid).collection("members").doc(user.uid).set({
+          busySlots, email: user.email || null, role: "teacher", status: "active",
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true }).catch(() => {});
+      });
+    }, 600);
+    return () => clearTimeout(t);
+  }, [busySlots, centerIds, user, dataLoading]);
+
   const handleLogout = async () => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     await auth.signOut();
+    setCenterIds([]);
+    setOwnedCenterId(null);
     setBusySlots({});
     setTasks([]);
     setDataLoading(true);
@@ -1391,6 +1904,16 @@ function App() {
       <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
         {view === "dashboard" && <DashboardView busySlots={busySlots} tasks={tasks} onDropTask={handleDropTask} />}
         {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} notify={notify} />}
+        {view === "center" && (
+          <CenterView
+            user={user}
+            centerIds={centerIds}
+            setCenterIds={setCenterIds}
+            ownedCenterId={ownedCenterId}
+            setOwnedCenterId={setOwnedCenterId}
+            notify={notify}
+          />
+        )}
         {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} busySlots={busySlots} notify={notify} />}
       </main>
 
