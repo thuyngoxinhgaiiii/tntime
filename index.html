@@ -566,13 +566,15 @@ function WeekGrid({ busySlots, tasks, onDropTask, selectedTaskId, onSelectTask }
 /*  Lịch chỉnh khung giờ bận — kéo chuột trực tiếp, chính xác tới 5 phút   */
 /* ---------------------------------------------------------------------- */
 
-function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock }) {
+function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock }) {
   const rowH = 34;
   const labelW = 54;
   const pxPerMin = rowH / 60;
   const totalHeight = HOURS.length * rowH;
   const dragRef = useRef(null); // { day, startMin, top }
   const [draft, setDraft] = useState(null); // { day, s, e }
+  const resizeRef = useRef(null); // { day, id, edge, top, fixedS, fixedE }
+  const [resize, setResize] = useState(null); // { day, id, s, e } — xem trước khi đang kéo chỉnh
 
   const minuteAtY = (y) => {
     const raw = DAY_START_MIN + y / pxPerMin;
@@ -580,27 +582,59 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock }) {
   };
 
   const handleMouseDown = (day) => (e) => {
-    if (e.target !== e.currentTarget) return; // bấm vào khối đã có, để onClick của khối đó xử lý
+    if (e.target !== e.currentTarget) return; // bấm vào khối đã có, để xử lý riêng (kéo mép / bấm mở form)
     const rect = e.currentTarget.getBoundingClientRect();
     const m = minuteAtY(e.clientY - rect.top);
     dragRef.current = { day, startMin: m, top: rect.top };
     setDraft({ day, s: m, e: m });
   };
 
+  // Kéo mép trên/dưới của 1 khối đã có để chỉnh lại giờ bắt đầu/kết thúc —
+  // dùng khi kéo lố vài phút và muốn sửa lại ngay trên lịch, không cần gõ tay.
+  const handleResizeStart = (day, block, edge) => (e) => {
+    e.stopPropagation();
+    const colEl = e.currentTarget.closest(".daycol");
+    const rect = colEl.getBoundingClientRect();
+    resizeRef.current = { day, id: block.id, edge, top: rect.top, fixedS: block.s, fixedE: block.e };
+    setResize({ day, id: block.id, s: block.s, e: block.e });
+  };
+
   useEffect(() => {
     const handleMove = (e) => {
-      if (!dragRef.current) return;
-      const { day, startMin, top } = dragRef.current;
-      const m = minuteAtY(e.clientY - top);
-      setDraft({ day, s: Math.min(startMin, m), e: Math.max(startMin, m) });
+      if (dragRef.current) {
+        const { day, startMin, top } = dragRef.current;
+        const m = minuteAtY(e.clientY - top);
+        setDraft({ day, s: Math.min(startMin, m), e: Math.max(startMin, m) });
+        return;
+      }
+      if (resizeRef.current) {
+        const { day, id, edge, top, fixedS, fixedE } = resizeRef.current;
+        const m = minuteAtY(e.clientY - top);
+        if (edge === "start") {
+          const newS = Math.max(DAY_START_MIN, Math.min(m, fixedE - TIME_STEP_MIN));
+          setResize({ day, id, s: newS, e: fixedE });
+        } else {
+          const newE = Math.min(DAY_END_MIN, Math.max(m, fixedS + TIME_STEP_MIN));
+          setResize({ day, id, s: fixedS, e: newE });
+        }
+      }
     };
     const handleUp = () => {
-      if (!dragRef.current) return;
-      dragRef.current = null;
-      setDraft((d) => {
-        if (d && d.e - d.s >= TIME_STEP_MIN) onCreateDraft(d.day, d.s, d.e);
-        return null;
-      });
+      if (dragRef.current) {
+        dragRef.current = null;
+        setDraft((d) => {
+          if (d && d.e - d.s >= TIME_STEP_MIN) onCreateDraft(d.day, d.s, d.e);
+          return null;
+        });
+      }
+      if (resizeRef.current) {
+        const { day, id } = resizeRef.current;
+        resizeRef.current = null;
+        setResize((r) => {
+          if (r) onResizeBlock(day, id, { s: r.s, e: r.e });
+          return null;
+        });
+      }
     };
     window.addEventListener("mousemove", handleMove);
     window.addEventListener("mouseup", handleUp);
@@ -608,7 +642,7 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock }) {
       window.removeEventListener("mousemove", handleMove);
       window.removeEventListener("mouseup", handleUp);
     };
-  }, [onCreateDraft]);
+  }, [onCreateDraft, onResizeBlock]);
 
   return (
     <div className="overflow-x-auto">
@@ -626,6 +660,7 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock }) {
           <div key={d.short} style={{ flex: 1, minWidth: 64 }}>
             <div className="flex items-end justify-center pb-1 text-xs font-semibold" style={{ height: 24, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
             <div
+              className="daycol"
               onMouseDown={handleMouseDown(di)}
               style={{
                 position: "relative", height: totalHeight, cursor: "crosshair",
@@ -635,19 +670,36 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock }) {
                 borderRight: "1px solid #FDF3F7",
               }}
             >
-              {(busySlots[di] || []).map((b) => (
-                <div
-                  key={b.id}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={(e) => { e.stopPropagation(); onSelectBlock(di, b); }}
-                  title={b.note || "Bận"}
-                  className="absolute left-0.5 right-0.5 cursor-pointer overflow-hidden rounded-md border px-1.5 py-0.5 text-[10.5px] leading-tight hover:brightness-95"
-                  style={{ top: (b.s - DAY_START_MIN) * pxPerMin, height: Math.max(8, (b.e - b.s) * pxPerMin), backgroundColor: "#FBD9E7", borderColor: DANGER, color: "#7A3348" }}
-                >
-                  <span className="font-semibold">{minToHHMM(b.s)}–{minToHHMM(b.e)}</span>
-                  {b.note && <div className="truncate opacity-80">{b.note}</div>}
-                </div>
-              ))}
+              {(busySlots[di] || []).map((b) => {
+                const live = resize && resize.day === di && resize.id === b.id ? resize : b;
+                return (
+                  <div
+                    key={b.id}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => { e.stopPropagation(); onSelectBlock(di, b); }}
+                    title={b.note || "Bận"}
+                    className="absolute left-0.5 right-0.5 cursor-pointer overflow-hidden rounded-md border px-1.5 py-0.5 text-[10.5px] leading-tight hover:brightness-95"
+                    style={{ top: (live.s - DAY_START_MIN) * pxPerMin, height: Math.max(8, (live.e - live.s) * pxPerMin), backgroundColor: "#FBD9E7", borderColor: DANGER, color: "#7A3348" }}
+                  >
+                    <div
+                      onMouseDown={handleResizeStart(di, b, "start")}
+                      onClick={(e) => e.stopPropagation()}
+                      title="Kéo để chỉnh giờ bắt đầu"
+                      className="absolute left-0 right-0 top-0"
+                      style={{ height: 7, cursor: "ns-resize" }}
+                    />
+                    <span className="font-semibold">{minToHHMM(live.s)}–{minToHHMM(live.e)}</span>
+                    {b.note && <div className="truncate opacity-80">{b.note}</div>}
+                    <div
+                      onMouseDown={handleResizeStart(di, b, "end")}
+                      onClick={(e) => e.stopPropagation()}
+                      title="Kéo để chỉnh giờ kết thúc"
+                      className="absolute left-0 right-0 bottom-0"
+                      style={{ height: 7, cursor: "ns-resize" }}
+                    />
+                  </div>
+                );
+              })}
               {draft && draft.day === di && (
                 <div
                   className="absolute left-0.5 right-0.5 rounded-md border-2 border-dashed"
@@ -737,7 +789,7 @@ function SlotEditorView({ busySlots, setBusySlots, notify }) {
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
             <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ bận</p>
-            <p className="text-xs" style={{ color: MUTED }}>Kéo chuột trên lịch để chọn chính xác tới 5 phút · khung giờ chưa đánh dấu mặc định là rảnh · {formatDuration(totalFreeMin)} rảnh / tuần</p>
+            <p className="text-xs" style={{ color: MUTED }}>Kéo chuột trên lịch để chọn chính xác tới 5 phút · kéo mép trên/dưới của khối đã có để chỉnh lại · khung giờ chưa đánh dấu mặc định là rảnh · {formatDuration(totalFreeMin)} rảnh / tuần</p>
           </div>
           <button onClick={() => { setBusySlots({}); setEditing(null); }} className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
             <RotateCcw size={13} /> Xoá tất cả
@@ -755,6 +807,12 @@ function SlotEditorView({ busySlots, setBusySlots, notify }) {
             setEditing({ day, id: newId, s: cs, e: ce, note: "", isDraft: true });
           }}
           onSelectBlock={(day, block) => setEditing({ day, id: block.id, s: block.s, e: block.e, note: block.note || "" })}
+          onResizeBlock={(day, id, patch) => {
+            // Kéo mép để chỉnh giờ trực tiếp trên lịch (VD kéo lố vài phút thì
+            // kéo lại cho khớp) — cập nhật cả form đang mở nếu đúng khối đó.
+            setBusySlots((prev) => updateBusyBlock(prev, day, id, patch));
+            setEditing((prev) => (prev && prev.id === id ? { ...prev, ...patch } : prev));
+          }}
         />
       </div>
 
@@ -771,7 +829,7 @@ function BusyBlockForm({ editing, setEditing, setBusySlots, notify }) {
   if (!editing) {
     return (
       <div className="rounded-2xl border border-dashed p-4 text-center text-xs" style={{ borderColor: BORDER, color: MUTED }}>
-        Kéo chuột trên lịch phía trên để đánh dấu khung giờ bận (chính xác tới 5 phút), hoặc bấm vào một khung đã đánh dấu để sửa / xoá.
+        Kéo chuột trên lịch phía trên để đánh dấu khung giờ bận (chính xác tới 5 phút). Muốn chỉnh lại 1 khung đã có: kéo mép trên/dưới của khối đó để đổi giờ trực tiếp, hoặc bấm vào giữa khối để sửa / xoá.
       </div>
     );
   }
