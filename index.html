@@ -576,6 +576,13 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
   const resizeRef = useRef(null); // { day, id, edge, top, fixedS, fixedE }
   const [resize, setResize] = useState(null); // { day, id, s, e } — xem trước khi đang kéo chỉnh
 
+  // Giữ giá trị xem-trước mới nhất trong ref (song song với state chỉ để vẽ),
+  // để lúc thả chuột đọc trực tiếp từ ref thay vì đọc qua callback của setState
+  // (gọi callback cha bên trong updater của setState là nguyên nhân gây lỗi
+  // React #185 "Maximum update depth exceeded").
+  const draftValueRef = useRef(null);
+  const resizeValueRef = useRef(null);
+
   const minuteAtY = (y) => {
     const raw = DAY_START_MIN + y / pxPerMin;
     return Math.min(DAY_END_MIN, Math.max(DAY_START_MIN, roundToStep(raw)));
@@ -586,7 +593,9 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
     const rect = e.currentTarget.getBoundingClientRect();
     const m = minuteAtY(e.clientY - rect.top);
     dragRef.current = { day, startMin: m, top: rect.top };
-    setDraft({ day, s: m, e: m });
+    const next = { day, s: m, e: m };
+    draftValueRef.current = next;
+    setDraft(next);
   };
 
   // Kéo mép trên/dưới của 1 khối đã có để chỉnh lại giờ bắt đầu/kết thúc —
@@ -596,7 +605,9 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
     const colEl = e.currentTarget.closest(".daycol");
     const rect = colEl.getBoundingClientRect();
     resizeRef.current = { day, id: block.id, edge, top: rect.top, fixedS: block.s, fixedE: block.e };
-    setResize({ day, id: block.id, s: block.s, e: block.e });
+    const next = { day, id: block.id, s: block.s, e: block.e };
+    resizeValueRef.current = next;
+    setResize(next);
   };
 
   useEffect(() => {
@@ -604,36 +615,40 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
       if (dragRef.current) {
         const { day, startMin, top } = dragRef.current;
         const m = minuteAtY(e.clientY - top);
-        setDraft({ day, s: Math.min(startMin, m), e: Math.max(startMin, m) });
+        const next = { day, s: Math.min(startMin, m), e: Math.max(startMin, m) };
+        draftValueRef.current = next;
+        setDraft(next);
         return;
       }
       if (resizeRef.current) {
         const { day, id, edge, top, fixedS, fixedE } = resizeRef.current;
         const m = minuteAtY(e.clientY - top);
+        let next;
         if (edge === "start") {
           const newS = Math.max(DAY_START_MIN, Math.min(m, fixedE - TIME_STEP_MIN));
-          setResize({ day, id, s: newS, e: fixedE });
+          next = { day, id, s: newS, e: fixedE };
         } else {
           const newE = Math.min(DAY_END_MIN, Math.max(m, fixedS + TIME_STEP_MIN));
-          setResize({ day, id, s: fixedS, e: newE });
+          next = { day, id, s: fixedS, e: newE };
         }
+        resizeValueRef.current = next;
+        setResize(next);
       }
     };
     const handleUp = () => {
       if (dragRef.current) {
         dragRef.current = null;
-        setDraft((d) => {
-          if (d && d.e - d.s >= TIME_STEP_MIN) onCreateDraft(d.day, d.s, d.e);
-          return null;
-        });
+        const d = draftValueRef.current;
+        draftValueRef.current = null;
+        setDraft(null);
+        if (d && d.e - d.s >= TIME_STEP_MIN) onCreateDraft(d.day, d.s, d.e);
       }
       if (resizeRef.current) {
-        const { day, id } = resizeRef.current;
         resizeRef.current = null;
-        setResize((r) => {
-          if (r) onResizeBlock(day, id, { s: r.s, e: r.e });
-          return null;
-        });
+        const r = resizeValueRef.current;
+        resizeValueRef.current = null;
+        setResize(null);
+        if (r) onResizeBlock(r.day, r.id, { s: r.s, e: r.e });
       }
     };
     window.addEventListener("mousemove", handleMove);
@@ -783,6 +798,30 @@ function SlotEditorView({ busySlots, setBusySlots, notify }) {
   const [editing, setEditing] = useState(null); // { day, id, s, e, note }
   const totalFreeMin = totalFreeMinutes(busySlots);
 
+  // Bọc useCallback để giữ nguyên tham chiếu hàm giữa các lần render — nếu
+  // không, useEffect trong BusyEditorGrid sẽ nghĩ dependency đổi liên tục
+  // và gỡ/gắn lại listener mỗi lần render, dễ gây lỗi React #185.
+  const handleCreateDraft = useCallback((day, s, e) => {
+    // Cố định khối ngay khi thả chuột, để khung giờ không "biến mất"
+    // sau khi kéo — form bên dưới chỉ dùng để ghi chú / chỉnh thêm.
+    const [cs, ce] = clampRange(s, e);
+    if (ce <= cs) return;
+    const newId = uid();
+    setBusySlots((prev) => ({ ...prev, [day]: [...(prev[day] || []), { id: newId, s: cs, e: ce, note: "" }] }));
+    setEditing({ day, id: newId, s: cs, e: ce, note: "", isDraft: true });
+  }, [setBusySlots]);
+
+  const handleSelectBlock = useCallback((day, block) => {
+    setEditing({ day, id: block.id, s: block.s, e: block.e, note: block.note || "" });
+  }, []);
+
+  const handleResizeBlock = useCallback((day, id, patch) => {
+    // Kéo mép để chỉnh giờ trực tiếp trên lịch (VD kéo lố vài phút thì
+    // kéo lại cho khớp) — cập nhật cả form đang mở nếu đúng khối đó.
+    setBusySlots((prev) => updateBusyBlock(prev, day, id, patch));
+    setEditing((prev) => (prev && prev.id === id ? { ...prev, ...patch } : prev));
+  }, [setBusySlots]);
+
   return (
     <div className="space-y-4">
       <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
@@ -797,22 +836,9 @@ function SlotEditorView({ busySlots, setBusySlots, notify }) {
         </div>
         <BusyEditorGrid
           busySlots={busySlots}
-          onCreateDraft={(day, s, e) => {
-            // Cố định khối ngay khi thả chuột, để khung giờ không "biến mất"
-            // sau khi kéo — form bên dưới chỉ dùng để ghi chú / chỉnh thêm.
-            const [cs, ce] = clampRange(s, e);
-            if (ce <= cs) return;
-            const newId = uid();
-            setBusySlots((prev) => ({ ...prev, [day]: [...(prev[day] || []), { id: newId, s: cs, e: ce, note: "" }] }));
-            setEditing({ day, id: newId, s: cs, e: ce, note: "", isDraft: true });
-          }}
-          onSelectBlock={(day, block) => setEditing({ day, id: block.id, s: block.s, e: block.e, note: block.note || "" })}
-          onResizeBlock={(day, id, patch) => {
-            // Kéo mép để chỉnh giờ trực tiếp trên lịch (VD kéo lố vài phút thì
-            // kéo lại cho khớp) — cập nhật cả form đang mở nếu đúng khối đó.
-            setBusySlots((prev) => updateBusyBlock(prev, day, id, patch));
-            setEditing((prev) => (prev && prev.id === id ? { ...prev, ...patch } : prev));
-          }}
+          onCreateDraft={handleCreateDraft}
+          onSelectBlock={handleSelectBlock}
+          onResizeBlock={handleResizeBlock}
         />
       </div>
 
