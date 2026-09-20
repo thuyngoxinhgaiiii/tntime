@@ -716,7 +716,7 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
                       style={{ height: 7, cursor: "ns-resize" }}
                     />
                     <span className="font-semibold">{minToHHMM(live.s)}–{minToHHMM(live.e)}</span>
-                    {b.note && <div className="truncate opacity-80">{b.note}</div>}
+                    {b.note && <div className="whitespace-normal break-words opacity-80">{b.note}</div>}
                     <div
                       onMouseDown={handleResizeStart(di, b, "end")}
                       onClick={(e) => e.stopPropagation()}
@@ -750,6 +750,7 @@ function DashboardView({ busySlots, tasks, onDropTask }) {
   const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
 
   const totalFreeMin = totalFreeMinutes(busySlots);
+  const totalBusyMin = totalBusyMinutes(busySlots);
   const scheduled = tasks.filter((t) => t.status === "scheduled");
   const scheduledHours = scheduled.reduce((s, t) => s + t.duration, 0);
   const unscheduledCount = tasks.filter((t) => t.status === "unscheduled").length;
@@ -765,7 +766,7 @@ function DashboardView({ busySlots, tasks, onDropTask }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard icon={Clock3} label="Giờ rảnh / tuần" value={formatDuration(totalFreeMin)} accent={PRIMARY} />
+        <StatCard icon={Clock3} label="Giờ bận / tuần" value={formatDuration(totalBusyMin)} accent={PRIMARY} />
         <StatCard icon={CalendarClock} label="Đã sắp xếp" value={`${scheduledHours}h`} sub={`${scheduled.length} việc`} accent={SECONDARY} />
         <StatCard icon={LayoutGrid} label="Tỷ lệ sử dụng" value={`${utilization}%`} accent={PURPLE} />
         <StatCard icon={AlertTriangle} label="Chưa sắp xếp được" value={unscheduledCount} sub={unscheduledCount ? "cần điều chỉnh" : "ổn"} accent={DANGER} />
