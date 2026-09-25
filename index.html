@@ -33,6 +33,7 @@
   ::-webkit-scrollbar-thumb { background: #F6D6E4; border-radius: 8px; }
   select, input { background-color: #FFFFFF; }
   .bg-blob { position: fixed; border-radius: 999px; filter: blur(2px); pointer-events: none; z-index: 0; }
+  @keyframes tn-spin { to { transform: rotate(360deg); } }
   @keyframes floaty { 0%,100% { transform: translateY(0px); } 50% { transform: translateY(-6px); } }
   .float-slow { animation: floaty 6s ease-in-out infinite; }
   .float-slower { animation: floaty 8s ease-in-out infinite; animation-delay: .8s; }
@@ -448,7 +449,7 @@ function normalizeLoadedBusySlots(raw) {
   const out = {};
   Object.keys(raw).forEach((d) => {
     out[d] = (raw[d] || [])
-      .map((b) => ({ id: b.id || uid(), s: Number(b.s), e: Number(b.e), note: typeof b.note === "string" ? b.note : "", tag: typeof b.tag === "string" ? b.tag : "" }))
+      .map((b) => ({ id: b.id || uid(), s: Number(b.s), e: Number(b.e), note: typeof b.note === "string" ? b.note : "", tag: typeof b.tag === "string" ? b.tag : "", ...(b.g && typeof b.g === "object" ? { g: b.g } : {}) }))
       .filter((b) => b.e > b.s);
   });
   return out;
@@ -620,6 +621,524 @@ function Toast({ toast, onClose }) {
 }
 
 /* ---------------------------------------------------------------------- */
+/*  Đồng bộ 2 chiều với Google Calendar (chạy hoàn toàn trên trình duyệt)  */
+/*  - Web → Google: khung giờ bận + việc đã sắp xếp nằm trong lịch riêng   */
+/*    tên "TNTime" trên Google Calendar (mỗi sự kiện mang tntimeId).       */
+/*  - Google → Web: sự kiện trong lịch chính (primary) thành khung giờ bận  */
+/*    (không gắn tag). Sửa / xoá ở bên nào thì bên kia cập nhật theo.       */
+/*  - Chỉ đồng bộ khi web đang mở (không có máy chủ riêng).                */
+/* ---------------------------------------------------------------------- */
+
+// OAuth Client ID (Web) của dự án Google Cloud "tntime-b0d74".
+const GOOGLE_CLIENT_ID = "857803558509-g1trkbmu8h74t71c6f6pb1j1ojvb9f1a.apps.googleusercontent.com";
+const GCAL_SCOPE = "https://www.googleapis.com/auth/calendar";
+const GCAL_API = "https://www.googleapis.com/calendar/v3";
+const GCAL_CAL_NAME = "TNTime";
+const WD_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+const GCAL_COLORS = { 1: "#7986cb", 2: "#33b679", 3: "#8e24aa", 4: "#e67c73", 5: "#f6bf26", 6: "#f4511e", 7: "#039be5", 8: "#616161", 9: "#3f51b5", 10: "#0b8043", 11: "#d50000" };
+
+function nearestGcalColor(hex) {
+  const [r, g, b] = hexToRgb(hex);
+  let best = "7", bd = Infinity;
+  Object.entries(GCAL_COLORS).forEach(([id, c]) => {
+    const [cr, cg, cb] = hexToRgb(c);
+    const d = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2;
+    if (d < bd) { bd = d; best = id; }
+  });
+  return best;
+}
+function strHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+function userTZ() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Ho_Chi_Minh"; } catch (e) { return "Asia/Ho_Chi_Minh"; }
+}
+/* Xoá các giá trị undefined (Firestore không nhận undefined) */
+const clean = (o) => JSON.parse(JSON.stringify(o));
+
+function moveBusyBlock(map, fromKey, toKey, id, patch) {
+  const fk = String(fromKey), tk2 = String(toKey);
+  const from = map[fk] || [];
+  const b = from.find((x) => x.id === id);
+  if (!b) return map;
+  const nb = { ...b, ...patch };
+  if (fk === tk2) return { ...map, [fk]: from.map((x) => (x.id === id ? nb : x)) };
+  return { ...map, [fk]: from.filter((x) => x.id !== id), [tk2]: [...(map[tk2] || []), nb] };
+}
+function findBlockKey(map, id) {
+  for (const k of Object.keys(map || {})) if ((map[k] || []).some((b) => b.id === id)) return k;
+  return null;
+}
+
+/* --- Token Google (Google Identity Services, popup) --------------------- */
+
+function loadGis() {
+  return new Promise((resolve, reject) => {
+    if (window.google && window.google.accounts && window.google.accounts.oauth2) return resolve();
+    const exist = document.getElementById("gis-script");
+    const s = exist || document.createElement("script");
+    s.addEventListener("load", () => resolve());
+    s.addEventListener("error", () => reject(new Error("gis-load")));
+    if (!exist) { s.id = "gis-script"; s.src = "https://accounts.google.com/gsi/client"; s.async = true; document.head.appendChild(s); }
+  });
+}
+const gcalTokenKey = (uid) => "tntime_gcal_token_" + uid;
+function loadStoredToken(uid) {
+  try { const o = JSON.parse(sessionStorage.getItem(gcalTokenKey(uid)) || "null"); if (o && o.exp > Date.now() + 60000) return o; } catch (e) {}
+  return null;
+}
+function storeToken(uid, o) { try { sessionStorage.setItem(gcalTokenKey(uid), JSON.stringify(o)); } catch (e) {} }
+function clearStoredToken(uid) { try { sessionStorage.removeItem(gcalTokenKey(uid)); } catch (e) {} }
+
+/* Phải gọi trực tiếp trong 1 cú bấm của người dùng (popup) */
+function requestGcalToken({ hint, prompt }) {
+  return new Promise((resolve, reject) => {
+    if (!GOOGLE_CLIENT_ID) return reject(Object.assign(new Error("Chưa cấu hình Google Client ID"), { code: "no-client" }));
+    if (!(window.google && window.google.accounts && window.google.accounts.oauth2)) return reject(Object.assign(new Error("Chưa tải được thư viện đăng nhập Google — kiểm tra mạng/VPN rồi thử lại."), { code: "gis" }));
+    const client = window.google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: GCAL_SCOPE,
+      callback: (r) => {
+        if (r.error) return reject(Object.assign(new Error(r.error_description || r.error), { code: r.error }));
+        if (window.google.accounts.oauth2.hasGrantedAllScopes && !window.google.accounts.oauth2.hasGrantedAllScopes(r, GCAL_SCOPE)) {
+          return reject(Object.assign(new Error("Bạn chưa tích quyền truy cập lịch khi đăng nhập Google."), { code: "scope" }));
+        }
+        resolve({ token: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 - 120000 });
+      },
+      error_callback: (err) => reject(Object.assign(new Error(err && err.type === "popup_closed" ? "Đã đóng cửa sổ Google." : "Trình duyệt chặn cửa sổ đăng nhập Google."), { code: (err && err.type) || "popup" })),
+    });
+    client.requestAccessToken({ prompt: prompt || "", hint: hint || undefined });
+  });
+}
+
+/* --- Gọi Calendar API --------------------------------------------------- */
+
+async function gapi(token, method, path, { query, body } = {}) {
+  const qs = query ? "?" + new URLSearchParams(Object.entries(query).filter(([, v]) => v != null && v !== "").map(([k, v]) => [k, String(v)])).toString() : "";
+  const r = await fetch(GCAL_API + path + qs, {
+    method,
+    headers: { Authorization: "Bearer " + token, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (r.status === 204) return null;
+  const data = await r.json().catch(() => null);
+  if (!r.ok) {
+    const e = data && data.error;
+    const err = new Error((e && e.message) || "HTTP " + r.status);
+    err.status = r.status;
+    err.reason = e && e.errors && e.errors[0] && e.errors[0].reason;
+    throw err;
+  }
+  return data;
+}
+async function glistAll(token, path, query) {
+  let items = [], pageToken;
+  do {
+    const d = await gapi(token, "GET", path, { query: { ...query, pageToken, maxResults: 2500 } });
+    items = items.concat((d && d.items) || []);
+    pageToken = d && d.nextPageToken;
+  } while (pageToken);
+  return items;
+}
+async function gdel(token, path) {
+  try { await gapi(token, "DELETE", path); } catch (err) { if (err.status !== 404 && err.status !== 410) throw err; }
+}
+
+async function ensureGcalCalendar(token, calId) {
+  const enc = encodeURIComponent;
+  if (calId) {
+    try { await gapi(token, "GET", `/calendars/${enc(calId)}`); return { id: calId, created: false }; }
+    catch (err) { if (err.status !== 404 && err.status !== 403) throw err; }
+  }
+  const list = await glistAll(token, "/users/me/calendarList", { minAccessRole: "owner" });
+  const found = list.find((c) => c.summary === GCAL_CAL_NAME);
+  if (found) return { id: found.id, created: false };
+  const cal = await gapi(token, "POST", "/calendars", { body: { summary: GCAL_CAL_NAME, description: "Khung giờ bận và việc đã sắp xếp từ web TNTime", timeZone: userTZ() } });
+  return { id: cal.id, created: true };
+}
+
+/* --- Chuyển đổi dữ liệu -------------------------------------------------- */
+
+function gDT(dk, min, tz) {
+  return { dateTime: `${dk}T${pad2(Math.floor(min / 60))}:${pad2(min % 60)}:00`, timeZone: tz };
+}
+/* Giờ của sự kiện (theo múi giờ máy) → { dk, di, s, e }; bỏ sự kiện cả ngày */
+function parseEvTime(ev) {
+  if (!ev || !ev.start || !ev.start.dateTime || !ev.end || !ev.end.dateTime) return null;
+  const a = new Date(ev.start.dateTime), b = new Date(ev.end.dateTime);
+  if (isNaN(a) || isNaN(b)) return null;
+  const dk = dateKey(a);
+  let s = a.getHours() * 60 + a.getMinutes();
+  let e = dateKey(b) === dk ? b.getHours() * 60 + b.getMinutes() : DAY_END_MIN;
+  s = Math.max(s, DAY_START_MIN);
+  e = Math.min(e, DAY_END_MIN);
+  if (e <= s) return null;
+  return { dk, di: weekdayIdx(a), s, e };
+}
+function parseRRule(lines) {
+  const line = (lines || []).find((l) => /^RRULE:/i.test(l));
+  if (!line) return null;
+  const kv = {};
+  line.slice(6).split(";").forEach((p) => { const [k, v] = p.split("="); if (k) kv[k.toUpperCase()] = v || ""; });
+  const interval = Number(kv.INTERVAL || 1);
+  const days = (kv.BYDAY || "").split(",").map((c) => WD_CODES.indexOf(c.replace(/^[+-]?\d+/, "").toUpperCase())).filter((d) => d >= 0);
+  let until = null;
+  if (kv.UNTIL) { const m = /^(\d{4})(\d{2})(\d{2})/.exec(kv.UNTIL); if (m) until = `${m[1]}-${m[2]}-${m[3]}`; }
+  return { simple: kv.FREQ === "WEEKLY" && interval === 1, days: [...new Set(days)], until };
+}
+function buildRRule(lines, days) {
+  const byday = "BYDAY=" + [...days].sort((a, b) => a - b).map((d) => WD_CODES[d]).join(",");
+  return (lines || []).map((l) => {
+    if (!/^RRULE:/i.test(l)) return l;
+    const parts = l.slice(6).split(";").filter((p) => p && !/^BYDAY=/i.test(p));
+    return "RRULE:" + [...parts, byday].join(";");
+  });
+}
+
+const blockSummary = (b, tags) => (b.note && b.note.trim()) || (findTag(tags, b.tag) || {}).label || "Bận";
+function blockColor(b, tags) { const t = findTag(tags, b.tag); return t ? nearestGcalColor(t.color) : "4"; }
+function ownBlockSig(kind, key, b, tags) {
+  return strHash([kind === "weekly" ? "w" : "o", key, b.s, b.e, blockSummary(b, tags), blockColor(b, tags)].join("|"));
+}
+function ownTaskSig(t, tags) {
+  return strHash(["t", t.scheduledDate, t.scheduledStart, t.scheduledStart + taskMinutes(t), t.name, nearestGcalColor(catOfTask(tags, t.category).solid)].join("|"));
+}
+const impSig = (kind, key, b) => strHash(["i", kind, key, b.s, b.e, b.note || ""].join("|"));
+
+/* Danh sách khối / việc "của web" cần có trong lịch TNTime trên Google */
+function ownItemList(st, tz, fresh) {
+  const out = [];
+  const wk0 = startOfWeek(new Date());
+  const gOf = (x) => (fresh ? null : x.g || null);
+  Object.keys(st.busySlots || {}).forEach((k) => (st.busySlots[k] || []).forEach((b) => {
+    if (b.g && b.g.src === "import") return;
+    const di = Number(k), dk = dateKey(addDays(wk0, di));
+    const summary = blockSummary(b, st.tags);
+    const tagLabel = (findTag(st.tags, b.tag) || {}).label;
+    out.push({
+      kind: "weekly", id: b.id, key: String(di), item: { ...b, g: gOf(b) }, summary, sig: ownBlockSig("weekly", String(di), b, st.tags),
+      body: {
+        summary, description: "Khung giờ bận (lặp hằng tuần) từ TNTime" + (tagLabel ? ` · ${tagLabel}` : ""),
+        start: gDT(dk, b.s, tz), end: gDT(dk, b.e, tz), recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${WD_CODES[di]}`],
+        colorId: blockColor(b, st.tags), extendedProperties: { private: { tntimeId: b.id, tntimeKind: "weekly" } },
+      },
+    });
+  }));
+  Object.keys(st.busyOnce || {}).forEach((dk) => (st.busyOnce[dk] || []).forEach((b) => {
+    if (b.g && b.g.src === "import") return;
+    const summary = blockSummary(b, st.tags);
+    const tagLabel = (findTag(st.tags, b.tag) || {}).label;
+    out.push({
+      kind: "once", id: b.id, key: dk, item: { ...b, g: gOf(b) }, summary, sig: ownBlockSig("once", dk, b, st.tags),
+      body: {
+        summary, description: "Khung giờ bận từ TNTime" + (tagLabel ? ` · ${tagLabel}` : ""),
+        start: gDT(dk, b.s, tz), end: gDT(dk, b.e, tz),
+        colorId: blockColor(b, st.tags), extendedProperties: { private: { tntimeId: b.id, tntimeKind: "once" } },
+      },
+    });
+  }));
+  (st.tasks || []).forEach((t) => {
+    if (t.status !== "scheduled" || !t.scheduledDate || t.scheduledStart == null) return;
+    const c = catOfTask(st.tags, t.category);
+    out.push({
+      kind: "task", id: t.id, key: t.scheduledDate, item: { ...t, g: gOf(t) }, summary: t.name, sig: ownTaskSig(t, st.tags),
+      body: {
+        summary: t.name, description: `Việc cần làm từ TNTime · ${c.label} · hạn ${fmtDateLabel(t.deadlineDate)} ${minToHHMM(t.deadlineMin)}`,
+        start: gDT(t.scheduledDate, t.scheduledStart, tz), end: gDT(t.scheduledDate, Math.min(t.scheduledStart + taskMinutes(t), 24 * 60 - 1), tz),
+        colorId: nearestGcalColor(c.solid), extendedProperties: { private: { tntimeId: t.id, tntimeKind: "task" } },
+      },
+    });
+  });
+  return out;
+}
+
+/* Sự kiện của lịch TNTime bị sửa trên Google → giá trị mới cho web */
+function pullOwn(it, ev, tags) {
+  const p = parseEvTime(ev);
+  if (!p) return null;
+  if (it.kind === "task") {
+    const fields = { scheduledDate: p.dk, scheduledStart: p.s, duration: Math.max(0.25, Math.round(((p.e - p.s) / 60) * 100) / 100), name: ev.summary || it.item.name };
+    return { op: { t: "task", id: it.id, fields }, sig: ownTaskSig({ ...it.item, ...fields }, tags) };
+  }
+  const note = (ev.summary || "") === it.summary ? it.item.note || "" : ev.summary || "";
+  const key = it.kind === "weekly" ? String(p.di) : p.dk;
+  const fields = { s: p.s, e: p.e, note };
+  return { op: { t: "block", kind: it.kind, id: it.id, key, fields }, sig: ownBlockSig(it.kind, key, { ...it.item, ...fields }, tags) };
+}
+
+/* Một lượt đồng bộ: đọc 2 bên, ghi lên Google, trả về danh sách thay đổi
+   cần áp dụng cho dữ liệu trên web (ops). */
+async function gcalSyncCore(token, calId, st, fresh) {
+  const tz = userTZ();
+  const enc = encodeURIComponent;
+  const ops = [];
+  const stats = { up: 0, down: 0 };
+  const today = startOfDay(new Date());
+  const winStart = addDays(startOfWeek(today), -7), winEnd = addDays(today, 62);
+  const winStartKey = dateKey(winStart), winEndKey = dateKey(winEnd);
+  const timeMin = winStart.toISOString(), timeMax = winEnd.toISOString();
+
+  /* ---- 1. Lịch TNTime (khung bận + việc của web) ---- */
+  const calPath = `/calendars/${enc(calId)}/events`;
+  const ownEvs = await glistAll(token, calPath, { singleEvents: false, showDeleted: false });
+  const byTid = {};
+  for (const ev of ownEvs) {
+    const tid = ev.extendedProperties && ev.extendedProperties.private && ev.extendedProperties.private.tntimeId;
+    if (!tid || ev.status === "cancelled") continue;
+    if (byTid[tid]) { await gdel(token, `${calPath}/${enc(ev.id)}`); stats.up++; continue; }
+    byTid[tid] = ev;
+  }
+  for (const it of ownItemList(st, tz, fresh)) {
+    const ev = byTid[it.id];
+    delete byTid[it.id];
+    const g = it.item.g;
+    if (!ev) {
+      if (g && g.src === "own" && g.hash === it.sig) {
+        // Đã từng đồng bộ, web không đổi gì → bị xoá trên điện thoại / máy tính
+        if (it.kind === "task") ops.push({ t: "task", id: it.id, fields: { status: "pending", scheduledDate: null, scheduledStart: null, g: null } });
+        else ops.push({ t: "delBlock", kind: it.kind, id: it.id });
+        stats.down++;
+        continue;
+      }
+      const res = await gapi(token, "POST", calPath, { body: it.body });
+      ops.push({ t: "meta", kind: it.kind, id: it.id, g: { src: "own", hash: it.sig, upd: res.updated } });
+      stats.up++;
+      continue;
+    }
+    const localChanged = !g || g.src !== "own" || g.hash !== it.sig;
+    const evChanged = !!g && ev.updated > (g.upd || "");
+    if (localChanged) {
+      const res = await gapi(token, "PATCH", `${calPath}/${enc(ev.id)}`, { body: it.body });
+      ops.push({ t: "meta", kind: it.kind, id: it.id, g: { src: "own", hash: it.sig, upd: res.updated } });
+      stats.up++;
+    } else if (evChanged) {
+      const pulled = pullOwn(it, ev, st.tags);
+      if (pulled) { ops.push(pulled.op); ops.push({ t: "meta", kind: it.kind, id: it.id, g: { src: "own", hash: pulled.sig, upd: ev.updated } }); stats.down++; }
+      else ops.push({ t: "meta", kind: it.kind, id: it.id, g: { upd: ev.updated } });
+    }
+  }
+  // Sự kiện không còn tương ứng trên web (đã xoá khối / bỏ lịch việc) → xoá trên Google
+  for (const tid of Object.keys(byTid)) {
+    await gdel(token, `${calPath}/${enc(byTid[tid].id)}`);
+    stats.up++;
+    const t = (st.tasks || []).find((x) => x.id === tid);
+    if (t && t.g) ops.push({ t: "task", id: tid, fields: { g: null } });
+  }
+
+  /* ---- 2. Lịch chính trên Google → khung giờ bận trên web ---- */
+  const prim = "/calendars/primary/events";
+  const pEvs = await glistAll(token, prim, { singleEvents: false, showDeleted: false, timeMin, timeMax });
+  const desired = {}, masters = {};
+  for (const ev of pEvs) {
+    if (ev.status === "cancelled" || !ev.start || !ev.start.dateTime || ev.recurringEventId) continue;
+    if (ev.transparency === "transparent") continue;
+    if ((ev.attendees || []).some((a) => a.self && a.responseStatus === "declined")) continue;
+    if (ev.extendedProperties && ev.extendedProperties.private && ev.extendedProperties.private.tntimeId) continue;
+    const p = parseEvTime(ev);
+    if (ev.recurrence) {
+      const rr = parseRRule(ev.recurrence);
+      if (rr && rr.simple) {
+        if (!p || (rr.until && rr.until < dateKey(today))) continue;
+        masters[ev.id] = ev;
+        const days = rr.days.length ? rr.days : [p.di];
+        days.forEach((d) => { desired[`${ev.id}#${d}`] = { kind: "weekly", key: String(d), s: p.s, e: p.e, note: ev.summary || "", upd: ev.updated, gid: ev.id, day: d }; });
+      } else {
+        const insts = await glistAll(token, `${prim}/${enc(ev.id)}/instances`, { timeMin, timeMax, showDeleted: false });
+        insts.forEach((inst) => {
+          if (inst.status === "cancelled") return;
+          const q = parseEvTime(inst);
+          if (q) desired[inst.id] = { kind: "once", key: q.dk, s: q.s, e: q.e, note: inst.summary || "", upd: inst.updated, gid: inst.id };
+        });
+      }
+    } else if (p) {
+      desired[ev.id] = { kind: "once", key: p.dk, s: p.s, e: p.e, note: ev.summary || "", upd: ev.updated, gid: ev.id };
+    }
+  }
+
+  const localImp = [];
+  [["weekly", st.busySlots], ["once", st.busyOnce]].forEach(([kind, map]) => {
+    Object.keys(map || {}).forEach((k) => (map[k] || []).forEach((b) => { if (b.g && b.g.src === "import") localImp.push({ kind, key: String(k), b }); }));
+  });
+  const trash = st.gcalTrash || [];
+  const used = new Set(trash.map((x) => x.key));
+
+  // Khối nhập từ Google mà người dùng đã xoá trên web → xoá bên Google
+  for (const tr of trash) {
+    if (tr.kind === "weekly") {
+      const master = masters[tr.id];
+      if (master) {
+        const days = [...new Set(localImp.filter((x) => x.kind === "weekly" && x.b.g.id === tr.id).map((x) => Number(x.key)))];
+        if (!days.length) await gdel(token, `${prim}/${enc(tr.id)}`);
+        else await gapi(token, "PATCH", `${prim}/${enc(tr.id)}`, { body: { recurrence: buildRRule(master.recurrence, days) } });
+        stats.up++;
+      }
+      Object.keys(desired).forEach((k) => { if (desired[k].gid === tr.id && !localImp.some((x) => x.b.g.key === k)) used.add(k); });
+    } else {
+      await gdel(token, `${prim}/${enc(tr.id)}`);
+      stats.up++;
+    }
+  }
+  if (trash.length) ops.push({ t: "untrash", keys: trash.map((x) => x.key) });
+
+  const groups = {};
+  for (const x of localImp) {
+    const { kind, key, b } = x;
+    const g = b.g;
+    const localChanged = impSig(kind, key, b) !== g.hash;
+    const d = desired[g.key];
+    if (kind === "weekly") {
+      if (masters[g.id]) {
+        if (localChanged || !d) (groups[g.id] = groups[g.id] || []).push(x);
+        else if (d.upd > (g.upd || "")) {
+          const fields = { s: d.s, e: d.e, note: d.note };
+          ops.push({ t: "block", kind, id: b.id, key: d.key, fields });
+          ops.push({ t: "meta", kind, id: b.id, g: { hash: impSig(kind, d.key, { ...b, ...fields }), upd: d.upd } });
+          stats.down++;
+        }
+        if (d) used.add(g.key);
+        continue;
+      }
+      if (!localChanged) { ops.push({ t: "delBlock", kind, id: b.id }); stats.down++; }
+      else ops.push({ t: "meta", kind, id: b.id, g: null });
+      continue;
+    }
+    if (!d) {
+      const origDk = g.dk || key;
+      if (origDk < winStartKey || origDk > winEndKey) continue;
+      if (!localChanged) { ops.push({ t: "delBlock", kind, id: b.id }); stats.down++; }
+      else ops.push({ t: "meta", kind, id: b.id, g: null });
+      continue;
+    }
+    used.add(g.key);
+    if (localChanged) {
+      const res = await gapi(token, "PATCH", `${prim}/${enc(d.gid)}`, { body: { summary: b.note || "Bận", start: gDT(key, b.s, tz), end: gDT(key, b.e, tz) } });
+      ops.push({ t: "meta", kind, id: b.id, g: { dk: key, hash: impSig(kind, key, b), upd: res.updated } });
+      stats.up++;
+    } else if (d.upd > (g.upd || "")) {
+      const fields = { s: d.s, e: d.e, note: d.note };
+      ops.push({ t: "block", kind, id: b.id, key: d.key, fields });
+      ops.push({ t: "meta", kind, id: b.id, g: { dk: d.key, hash: impSig(kind, d.key, { ...b, ...fields }), upd: d.upd } });
+      stats.down++;
+    }
+  }
+
+  // Khối lặp nhập từ Google bị sửa giờ / đổi thứ trên web → sửa sự kiện gốc
+  for (const mid of Object.keys(groups)) {
+    const master = masters[mid];
+    const all = localImp.filter((x) => x.kind === "weekly" && x.b.g.id === mid);
+    const ref = (groups[mid].find((x) => impSig("weekly", x.key, x.b) !== x.b.g.hash) || groups[mid][0]).b;
+    const days = [...new Set(all.map((x) => Number(x.key)))];
+    let sd = startOfDay(new Date(master.start.dateTime));
+    for (let i = 0; i < 7 && !days.includes(weekdayIdx(sd)); i++) sd = addDays(sd, 1);
+    const res = await gapi(token, "PATCH", `${prim}/${enc(mid)}`, {
+      body: { summary: ref.note || "Bận", start: gDT(dateKey(sd), ref.s, tz), end: gDT(dateKey(sd), ref.e, tz), recurrence: buildRRule(master.recurrence, days) },
+    });
+    stats.up++;
+    for (const x of all) {
+      const di = Number(x.key);
+      const fields = { s: ref.s, e: ref.e, note: ref.note || "" };
+      ops.push({ t: "block", kind: "weekly", id: x.b.id, fields });
+      ops.push({ t: "meta", kind: "weekly", id: x.b.id, g: { src: "import", cal: "primary", id: mid, day: di, key: `${mid}#${di}`, hash: impSig("weekly", x.key, { ...x.b, ...fields }), upd: res.updated } });
+      used.add(`${mid}#${di}`);
+    }
+    Object.keys(desired).forEach((k) => { if (desired[k].gid === mid) used.add(k); });
+  }
+
+  // Sự kiện mới trên Google → khung giờ bận mới (không gắn tag)
+  const localKeys = new Set(localImp.map((x) => x.b.g.key));
+  for (const k of Object.keys(desired)) {
+    if (used.has(k) || localKeys.has(k)) continue;
+    const d = desired[k];
+    const b = { id: uid(), s: d.s, e: d.e, note: d.note, tag: "" };
+    b.g = { src: "import", cal: "primary", id: d.gid, key: k, day: d.kind === "weekly" ? d.day : null, dk: d.kind === "once" ? d.key : null, hash: impSig(d.kind, d.key, b), upd: d.upd };
+    ops.push({ t: "addBlock", kind: d.kind, key: d.key, block: b });
+    stats.down++;
+  }
+  return { ops, stats };
+}
+
+/* --- Giao diện ----------------------------------------------------------- */
+
+const GcalContext = createContext(null);
+const useGcal = () => useContext(GcalContext);
+const GoogleCalIcon = makeIcon(<><rect x="3.5" y="4.5" width="17" height="16" rx="2.5" /><path d="M3.5 9.5h17" /><path d="M8 2.8v3.4" /><path d="M16 2.8v3.4" /><path d="M8.5 13.5h2.5v4" /><path d="M13.5 13.5h2.5l-1.8 4" /></>);
+const RefreshIcon = makeIcon(<><path d="M20 11a8 8 0 0 0-14.5-4.5L4 8" /><path d="M4 3.5V8h4.5" /><path d="M4 13a8 8 0 0 0 14.5 4.5L20 16" /><path d="M20 20.5V16h-4.5" /></>);
+
+function gcalStatusText(gc) {
+  const st = gc.status || {};
+  if (st.state === "syncing") return "Đang đồng bộ...";
+  if (st.state === "error") return st.msg || "Đồng bộ lỗi";
+  if (st.state === "needauth") return "Cần xác nhận lại với Google — bấm “Đồng bộ ngay”";
+  if (st.last) {
+    const t = new Date(st.last);
+    return `Đồng bộ lúc ${pad2(t.getHours())}:${pad2(t.getMinutes())}` + (st.stats ? ` · ↑${st.stats.up} gửi lên · ↓${st.stats.down} nhận về` : "");
+  }
+  return "Chưa đồng bộ lần nào trong phiên này";
+}
+
+function GcalChip() {
+  const gc = useGcal();
+  if (!gc || !gc.enabled) return null;
+  const st = gc.status || {};
+  const color = st.state === "error" ? DANGER : st.state === "needauth" ? "#B15C0E" : st.state === "ok" ? "#3E7A38" : MUTED;
+  return (
+    <button data-gcal-btn onClick={gc.syncNow} title={gcalStatusText(gc)} className="flex items-center gap-1" style={{ color }}>
+      <span style={{ display: "inline-flex", animation: st.state === "syncing" ? "tn-spin 1s linear infinite" : "none" }}><RefreshIcon size={11} /></span>
+      Google Calendar{st.state === "needauth" ? " · bấm để đồng bộ" : st.state === "error" ? " · lỗi" : ""}
+    </button>
+  );
+}
+
+function GcalCard() {
+  const gc = useGcal();
+  if (!gc) return null;
+  const btn = "flex items-center gap-1.5 rounded-full px-4 py-2 text-xs font-semibold";
+  const st = gc.status || {};
+  return (
+    <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-[240px] flex-1">
+          <p className="flex items-center gap-2 text-sm font-medium" style={{ color: INK }}><GoogleCalIcon size={16} /> Đồng bộ với Google Calendar {gc.enabled && <span className="rounded-full px-2 py-0.5 text-[10.5px] font-semibold" style={{ backgroundColor: "#EAF7E8", color: "#3E7A38" }}>Đã kết nối</span>}</p>
+          {gc.enabled ? (
+            <p className="mt-1 text-xs" style={{ color: st.state === "error" ? DANGER : MUTED }}>
+              {gc.email ? <b style={{ color: INK }}>{gc.email}</b> : null}{gc.email ? " · " : ""}{gcalStatusText(gc)}
+            </p>
+          ) : (
+            <p className="mt-1 text-xs leading-relaxed" style={{ color: MUTED }}>
+              Khung giờ bận và việc đã sắp xếp sẽ hiện trong lịch <b>“TNTime”</b> trên Google Calendar. Sự kiện bạn thêm vào lịch chính của Google (trên điện thoại / máy tính) sẽ tự thành khung giờ bận ở đây, chưa gắn tag. Sửa hoặc xoá ở bên nào, bên kia cũng cập nhật theo mỗi khi mở web.
+            </p>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {gc.enabled ? (
+            <>
+              <button data-gcal-btn onClick={gc.syncNow} disabled={st.state === "syncing"} className={btn + " text-white disabled:opacity-60"} style={{ backgroundColor: PRIMARY }}><RefreshIcon size={13} /> Đồng bộ ngay</button>
+              <button onClick={gc.disconnect} className={btn + " border"} style={{ borderColor: BORDER, color: "#8A6070" }}>Ngắt kết nối</button>
+            </>
+          ) : (
+            <button data-gcal-btn onClick={gc.connect} disabled={!gc.configured} className={btn + " text-white disabled:opacity-50"} style={{ backgroundColor: PRIMARY }}><GoogleCalIcon size={14} /> Kết nối Google Calendar</button>
+          )}
+        </div>
+      </div>
+      {!gc.configured && <p className="mt-2 text-[11px]" style={{ color: DANGER }}>Tính năng đang chờ quản trị viên cấu hình Google Cloud.</p>}
+      {!gc.enabled && gc.configured && st.state === "error" && <p className="mt-2 text-[11px]" style={{ color: DANGER }}>{st.msg}</p>}
+      <details className="mt-3 text-[11px]" style={{ color: MUTED }}>
+        <summary className="cursor-pointer select-none" style={{ color: "#8A6070" }}>Xem lịch trên iPhone / Mac / Android</summary>
+        <ul className="mt-1.5 list-disc space-y-0.5 pl-5">
+          <li><b>iPhone / iPad:</b> Cài đặt → Lịch → Tài khoản lịch → Thêm tài khoản → Google, đăng nhập đúng tài khoản đã kết nối, bật “Lịch”.</li>
+          <li><b>Mac:</b> mở app Lịch → Cài đặt → Tài khoản → dấu + → Google.</li>
+          <li><b>Android:</b> app Google Calendar có sẵn — lịch “TNTime” tự hiện.</li>
+          <li>Sự kiện muốn đưa vào web: tạo trong lịch <b>chính</b> của tài khoản Google (không phải lịch “TNTime”). Sự kiện cả ngày hoặc đặt “Rảnh” sẽ được bỏ qua.</li>
+          <li>Mỗi lần mở web, Google có thể hiện cửa sổ nhỏ xác nhận ở lần bấm đầu tiên — đó là bước lấy quyền đồng bộ.</li>
+        </ul>
+      </details>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
 /*  Lịch: trạng thái xem (tuần / tháng), chuyển tuần, phóng to thu nhỏ     */
 /*  - Chụm 2 ngón (trackpad hoặc màn hình cảm ứng) để thu nhỏ: tuần → tháng */
 /*  - Giãn 2 ngón để phóng to: tháng → tuần, tuần → giãn cao các giờ        */
@@ -759,7 +1278,7 @@ function CalendarPanel({ cal, children }) {
 /*  mode="plan": khung bận chỉ xem, kéo thả việc cần làm để đổi giờ        */
 /* ---------------------------------------------------------------------- */
 
-function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateDraft, onSelectBlock, onResizeBlock, onDropTask, selectedTaskId, onSelectTask }) {
+function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateDraft, onSelectBlock, onResizeBlock, onMoveBlock, onDropTask, selectedTaskId, onSelectTask }) {
   const tags = useTags();
   const editable = mode === "edit";
   const labelW = 54;
@@ -776,6 +1295,10 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
   const [resize, setResize] = useState(null);
   const resizeValueRef = useRef(null);
   const draggingTaskRef = useRef(null);
+  // Kéo cả khối bận sang giờ / ngày khác (giữ nguyên thời lượng)
+  const moveRef = useRef(null);
+  const [move, setMove] = useState(null); // { id, dk, di, s, e, tag, note }
+  const moveValueRef = useRef(null);
   const [dropHint, setDropHint] = useState(null); // { dk, s, e }
 
   const minuteAtY = (y, step = TIME_STEP_MIN, floor = false) => {
@@ -806,6 +1329,20 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
 
   useEffect(() => {
     const handleMove = (e) => {
+      if (moveRef.current) {
+        const m = moveRef.current;
+        const dx = e.clientX - m.x, dy = e.clientY - m.y;
+        if (!m.moved && Math.hypot(dx, dy) < 4) return;
+        m.moved = true;
+        const col = document.elementsFromPoint(e.clientX, e.clientY).find((el) => el.classList && el.classList.contains("daycol"));
+        const dur = m.b.e - m.b.s;
+        let ns = roundTo(m.b.s + dy / pxRef.current, TIME_STEP_MIN);
+        ns = Math.max(DAY_START_MIN, Math.min(DAY_END_MIN - dur, ns));
+        const next = { id: m.b.id, dk: col ? col.dataset.dk : m.dk, di: col ? Number(col.dataset.di) : m.di, s: ns, e: ns + dur, tag: m.b.tag, note: m.b.note };
+        moveValueRef.current = next;
+        setMove(next);
+        return;
+      }
       if (dragRef.current) {
         const { dk, di, startMin, top } = dragRef.current;
         const m = minuteAtY(e.clientY - top);
@@ -825,6 +1362,17 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
       }
     };
     const handleUp = () => {
+      if (moveRef.current) {
+        const m = moveRef.current;
+        moveRef.current = null;
+        const v = moveValueRef.current;
+        moveValueRef.current = null;
+        setMove(null);
+        if (m.moved && v) {
+          if ((v.dk !== m.dk || v.s !== m.b.s) && onMoveBlock) onMoveBlock(m.b, m.dk, m.di, v.dk, v.di, v.s, v.e);
+        } else if (onSelectBlock) onSelectBlock(m.b, m.dk, m.di);
+        return;
+      }
       if (dragRef.current) {
         dragRef.current = null;
         const d = draftValueRef.current;
@@ -847,7 +1395,7 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
       window.removeEventListener("mousemove", handleMove);
       window.removeEventListener("mouseup", handleUp);
     };
-  }, [onCreateDraft, onResizeBlock]);
+  }, [onCreateDraft, onResizeBlock, onMoveBlock, onSelectBlock]);
 
   const colDragOver = (dk) => (e) => {
     if (editable) return;
@@ -896,6 +1444,8 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
               </div>
               <div
                 className="daycol"
+                data-dk={dk}
+                data-di={di}
                 onMouseDown={handleMouseDown(dk, di)}
                 onDragOver={colDragOver(dk)}
                 onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDropHint((p) => (p && p.dk === dk ? null : p)); }}
@@ -912,21 +1462,28 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
                   const live = resize && resize.id === b.id ? resize : b;
                   const bs = busyStyleOf(tags, b.tag);
                   const h = Math.max(8, (live.e - live.s) * pxPerMin);
+                  const moving = move && move.id === b.id;
+                  const fromG = b.g && b.g.src === "import";
                   return (
                     <div
                       key={b.kind + b.id}
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => { if (!editable) return; e.stopPropagation(); onSelectBlock && onSelectBlock(b, dk, di); }}
-                      title={[minToHHMM(b.s) + "–" + minToHHMM(b.e), bs.label, b.note, b.kind === "once" ? "(chỉ ngày này)" : "(lặp hằng tuần)"].filter(Boolean).join(" · ")}
-                      className={"absolute left-0.5 right-0.5 overflow-hidden rounded-md border px-1.5 py-0.5 text-[10.5px] leading-tight " + (editable ? "cursor-pointer hover:brightness-95" : "")}
+                      onMouseDown={(e) => {
+                        e.stopPropagation();
+                        if (!editable || e.button !== 0) return;
+                        moveRef.current = { b, dk, di, x: e.clientX, y: e.clientY, moved: false };
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      title={[minToHHMM(b.s) + "–" + minToHHMM(b.e), bs.label, b.note, b.kind === "once" ? "(chỉ ngày này)" : "(lặp hằng tuần)", fromG ? "từ Google Calendar" : "", editable ? "kéo để đổi giờ / ngày, bấm để sửa" : ""].filter(Boolean).join(" · ")}
+                      className={"absolute left-0.5 right-0.5 overflow-hidden rounded-md border px-1.5 py-0.5 text-[10.5px] leading-tight " + (editable ? "cursor-grab hover:brightness-95" : "")}
                       style={{
                         top: (live.s - DAY_START_MIN) * pxPerMin, height: h,
                         backgroundColor: bs.bg, borderColor: bs.border, borderLeftWidth: 3, color: bs.text,
                         borderStyle: b.kind === "once" ? "dashed" : "solid",
                         pointerEvents: editable ? "auto" : "none",
-                        opacity: editable ? 1 : 0.85,
+                        opacity: moving ? 0.35 : editable ? 1 : 0.85,
                       }}
                     >
+                      {fromG && <span className="absolute right-1 top-0.5 text-[9px] font-bold opacity-70" title="Từ Google Calendar">G</span>}
                       {editable && <div onMouseDown={handleResizeStart(dk, di, b, "start")} onClick={(e) => e.stopPropagation()} title="Kéo để chỉnh giờ bắt đầu" className="absolute left-0 right-0 top-0" style={{ height: 7, cursor: "ns-resize" }} />}
                       <span className="font-semibold">{minToHHMM(live.s)}–{minToHHMM(live.e)}</span>
                       {h > 22 && bs.label && <div className="whitespace-normal break-words font-semibold">{bs.label}</div>}
@@ -967,6 +1524,14 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
                     </div>
                   );
                 })}
+                {move && move.dk === dk && (() => {
+                  const ms = busyStyleOf(tags, move.tag);
+                  return (
+                    <div className="pointer-events-none absolute left-0.5 right-0.5 overflow-hidden rounded-md border-2 border-dashed px-1.5 py-0.5 text-[10.5px] font-semibold leading-tight" style={{ top: (move.s - DAY_START_MIN) * pxPerMin, height: Math.max(8, (move.e - move.s) * pxPerMin), borderColor: ms.border, backgroundColor: ms.bg, color: ms.text, zIndex: 7, boxShadow: "0 4px 12px rgba(74,46,62,0.18)" }}>
+                      {minToHHMM(move.s)}–{minToHHMM(move.e)}
+                    </div>
+                  );
+                })()}
                 {dropHint && dropHint.dk === dk && (
                   <div className="pointer-events-none absolute left-0.5 right-0.5 rounded-md border-2 border-dashed" style={{ top: (dropHint.s - DAY_START_MIN) * pxPerMin, height: Math.max(6, (dropHint.e - dropHint.s) * pxPerMin), borderColor: SECONDARY, backgroundColor: "#FFF1D699", zIndex: 6 }} />
                 )}
@@ -1166,17 +1731,29 @@ function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks,
     setEditing((prev) => (prev && prev.id === b.id ? { ...prev, ...patch } : prev));
   }, [setterOf]);
 
+  // Kéo cả khối sang cột ngày khác / giờ khác
+  const handleMoveBlock = useCallback((b, fromDk, fromDi, toDk, toDi, s, e) => {
+    const weekly = b.kind === "weekly";
+    const fromKey = weekly ? fromDi : fromDk, toKey = weekly ? toDi : toDk;
+    setterOf(b.kind)((prev) => moveBusyBlock(prev, fromKey, toKey, b.id, { s, e }));
+    setEditing((prev) => (prev && prev.id === b.id ? { ...prev, s, e, dk: toDk, di: toDi, mk: toKey } : prev));
+    notify(weekly ? `Đã chuyển sang mỗi ${DAYS[toDi].full}, ${minToHHMM(s)}–${minToHHMM(e)}.` : `Đã chuyển sang ${fmtDateLabel(toDk)}, ${minToHHMM(s)}–${minToHHMM(e)}.`, "success");
+  }, [setterOf, notify]);
+
+  const getBlock = (kind, mk, id) => ((kind === "once" ? busyOnce : busySlots)[mk] || []).find((b) => b.id === id) || null;
+
   return (
     <div className="space-y-4">
+      <GcalCard />
       <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
             <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ bận</p>
-            <p className="text-xs" style={{ color: MUTED }}>Kéo chuột trên lịch để chọn (chính xác tới 5 phút) · kéo mép trên/dưới để chỉnh · việc đã sắp xếp hiện viền nét đứt · tuần đang xem còn {formatDuration(weekFreeMin)} rảnh</p>
+            <p className="text-xs" style={{ color: MUTED }}>Kéo chuột vào chỗ trống để tạo · kéo cả khối để đổi giờ / ngày · kéo mép trên/dưới để chỉnh · việc đã sắp xếp hiện viền nét đứt · tuần đang xem còn {formatDuration(weekFreeMin)} rảnh</p>
           </div>
           <button
             onClick={() => {
-              if (!window.confirm("Xoá TOÀN BỘ khung giờ bận đã đánh dấu (cả lặp hằng tuần lẫn từng ngày)? Hành động này không thể hoàn tác.")) return;
+              if (!window.confirm("Xoá TOÀN BỘ khung giờ bận đã đánh dấu (cả lặp hằng tuần lẫn từng ngày)? Hành động này không thể hoàn tác.\n(Nếu đang kết nối Google Calendar: sự kiện trong lịch chính của Google sẽ được nhập lại ở lần đồng bộ sau.)")) return;
               setBusySlots({});
               setBusyOnce({});
               setEditing(null);
@@ -1206,6 +1783,7 @@ function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks,
               onCreateDraft={handleCreateDraft}
               onSelectBlock={handleSelectBlock}
               onResizeBlock={handleResizeBlock}
+              onMoveBlock={handleMoveBlock}
             />
           ) : (
             <MonthCalendar anchor={cal.anchor} busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onPickDay={(d) => { cal.setAnchor(d); cal.setMode("week"); }} />
@@ -1213,22 +1791,64 @@ function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks,
         </CalendarPanel>
       </div>
 
-      <BusyBlockForm editing={editing} setEditing={setEditing} setterOf={setterOf} notify={notify} lastTagRef={lastTagRef} lastRepeatRef={lastRepeatRef} />
+      <BusyBlockForm editing={editing} setEditing={setEditing} setterOf={setterOf} notify={notify} lastTagRef={lastTagRef} lastRepeatRef={lastRepeatRef} getBlock={getBlock} onJump={(dk) => cal.setAnchor(parseKey(dk))} />
       <TagManager busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} setTags={setTags} notify={notify} />
     </div>
   );
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Form sửa 1 khối "khung giờ bận" — giờ, ghi chú, tag, lặp hay 1 lần     */
+/*  Ô nhập giờ — gõ tự do chính xác từng phút, không tự làm tròn khi gõ     */
 /* ---------------------------------------------------------------------- */
 
-function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, lastRepeatRef }) {
+function TimeField({ label, value, onChange }) {
+  const [draft, setDraft] = useState(minToHHMM(value));
+  const focused = useRef(false);
+  // Giá trị đổi từ bên ngoài (kéo trên lịch) → cập nhật ô, trừ khi đang gõ
+  useEffect(() => { if (!focused.current) setDraft(minToHHMM(value)); }, [value]);
+  const parse = (str) => {
+    const m = /^(\d{1,2}):(\d{2})/.exec(str || "");
+    if (!m) return null;
+    const h = Number(m[1]), mm = Number(m[2]);
+    if (h > 23 || mm > 59) return null;
+    return h * 60 + mm;
+  };
+  return (
+    <div>
+      <label className="mb-1 block text-xs" style={{ color: MUTED }}>{label}</label>
+      <input
+        type="time"
+        step={60}
+        value={draft}
+        onFocus={() => { focused.current = true; }}
+        onChange={(ev) => {
+          const v = ev.target.value;
+          setDraft(v);
+          const m = parse(v);
+          if (m != null && m !== value) onChange(m); // bỏ qua trạng thái gõ dở (giá trị rỗng)
+        }}
+        onBlur={() => {
+          focused.current = false;
+          if (parse(draft) == null) setDraft(minToHHMM(value));
+        }}
+        className="rounded-xl border px-2 py-2 text-sm outline-none"
+        style={{ borderColor: BORDER, color: INK }}
+      />
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Form sửa 1 khối "khung giờ bận" — giờ, ngày/thứ, ghi chú, tag, lặp     */
+/* ---------------------------------------------------------------------- */
+
+function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, lastRepeatRef, getBlock, onJump }) {
   const tags = useTags();
+  const gc = useGcal();
   if (!editing) {
     return (
       <div className="rounded-2xl border border-dashed p-4 text-center text-xs" style={{ borderColor: BORDER, color: MUTED }}>
-        Kéo chuột trên lịch phía trên để đánh dấu khung giờ bận. Muốn chỉnh 1 khung đã có: kéo mép trên/dưới để đổi giờ, hoặc bấm vào giữa khối để sửa ghi chú, gắn tag, chọn lặp hằng tuần hay chỉ 1 ngày, hoặc xoá.
+        Kéo chuột vào chỗ trống trên lịch để đánh dấu khung giờ bận. Kéo cả khối để chuyển sang giờ / ngày khác, kéo mép trên/dưới để đổi giờ bắt đầu / kết thúc, hoặc bấm vào khối để sửa giờ, ngày, ghi chú, tag, kiểu lặp hoặc xoá.
       </div>
     );
   }
@@ -1237,11 +1857,35 @@ function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, last
   const setField = (patch) => setEditing((prev) => ({ ...prev, ...patch }));
   const setMap = setterOf(kind);
   const liveUpdate = (patch) => { setField(patch); setMap((prev) => updateBusyBlock(prev, mk, id, patch)); };
+  const timeValid = (s, e) => e > s && s >= DAY_START_MIN && e <= DAY_END_MIN;
+
+  const setTime = (patch) => {
+    const next = { s: editing.s, e: editing.e, ...patch };
+    setField(patch);
+    if (timeValid(next.s, next.e)) setMap((prev) => updateBusyBlock(prev, mk, id, { s: next.s, e: next.e }));
+  };
+
+  // Đổi sang ngày khác (khung chỉ 1 ngày)
+  const changeDate = (newDk) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(newDk || "") || newDk === dk) return;
+    setMap((prev) => moveBusyBlock(prev, mk, newDk, id, {}));
+    setEditing((prev) => ({ ...prev, dk: newDk, mk: newDk, di: weekdayIdx(parseKey(newDk)) }));
+    if (onJump) onJump(newDk);
+  };
+  // Đổi sang thứ khác (khung lặp hằng tuần)
+  const changeWeekday = (newDi) => {
+    if (newDi === di) return;
+    setMap((prev) => moveBusyBlock(prev, mk, newDi, id, {}));
+    setEditing((prev) => ({ ...prev, di: newDi, mk: newDi, dk: dateKey(addDays(startOfWeek(parseKey(dk)), newDi)) }));
+  };
 
   const setRepeat = (repeat) => {
     const toKind = repeat ? "weekly" : "once";
     if (toKind === kind) return;
     const toMk = repeat ? di : dk;
+    const old = getBlock ? getBlock(kind, mk, id) : null;
+    // Khối đến từ Google đổi kiểu lặp → tách thành khối riêng của web
+    if (old && old.g && old.g.src === "import" && gc) gc.trashBlock(kind, old);
     const block = { id, s: editing.s, e: editing.e, note: editing.note, tag: editing.tag || "" };
     setMap((prev) => removeBusyBlock(prev, mk, id));
     setterOf(toKind)((prev) => ({ ...prev, [toMk]: [...(prev[toMk] || []), block] }));
@@ -1249,38 +1893,59 @@ function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, last
   };
 
   const save = () => {
-    if (editing.e <= editing.s) { notify("Giờ kết thúc phải sau giờ bắt đầu.", "error"); return; }
-    if (editing.s < DAY_START_MIN || editing.e > DAY_END_MIN) {
-      notify(`Chỉ có thể chọn trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`, "error");
+    if (!timeValid(editing.s, editing.e)) {
+      notify(editing.e <= editing.s ? "Giờ kết thúc phải sau giờ bắt đầu." : `Chỉ có thể chọn trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`, "error");
       return;
     }
     setMap((prev) => updateBusyBlock(prev, mk, id, { s: editing.s, e: editing.e, note: editing.note.trim(), tag: editing.tag || "" }));
-    notify(kind === "weekly" ? `Đã lưu — lặp lại mỗi ${DAYS[di].full}.` : `Đã lưu — chỉ ngày ${fmtDateLabel(dk)}.`, "success");
+    notify(kind === "weekly" ? `Đã lưu — lặp lại mỗi ${DAYS[di].full}.` : `Đã lưu — ngày ${fmtDateLabel(dk)}.`, "success");
     if (lastTagRef) lastTagRef.current = editing.tag || "";
     if (lastRepeatRef) lastRepeatRef.current = kind === "weekly";
     setEditing(null);
   };
 
   const remove = () => {
+    const old = getBlock ? getBlock(kind, mk, id) : null;
+    if (old && old.g && old.g.src === "import" && gc) gc.trashBlock(kind, old);
     setMap((prev) => removeBusyBlock(prev, mk, id));
     notify("Đã xoá khung giờ bận.", "success");
     setEditing(null);
   };
 
   const chip = (active, pal) => ({ borderColor: active ? pal.border : BORDER, borderWidth: active ? 2 : 1, backgroundColor: active ? pal.bg : "#FFFFFF", color: active ? pal.text : INK });
+  const bad = !timeValid(editing.s, editing.e);
+  const cur = getBlock ? getBlock(kind, mk, id) : null;
+  const fromGoogle = cur && cur.g && cur.g.src === "import";
 
   return (
     <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
-      <p className="mb-3 text-sm font-medium" style={{ color: INK }}>{editing.isDraft ? "Khung giờ bận mới" : "Sửa khung giờ bận"} — {fmtDateLabel(dk)}</p>
+      <p className="mb-3 text-sm font-medium" style={{ color: INK }}>
+        {editing.isDraft ? "Khung giờ bận mới" : "Sửa khung giờ bận"} — {kind === "weekly" ? `mỗi ${DAYS[di].full}` : fmtDateLabel(dk)}
+        {fromGoogle && <span className="ml-2 rounded-full px-2 py-0.5 text-[10.5px] font-semibold" style={{ backgroundColor: "#E8F0FE", color: "#1A56B8" }}>từ Google Calendar</span>}
+      </p>
       <div className="flex flex-wrap items-end gap-2">
-        <div>
-          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Bắt đầu</label>
-          <input type="time" step={TIME_STEP_MIN * 60} value={minToHHMM(editing.s)} onChange={(ev) => setField({ s: roundToStep(hhmmToMin(ev.target.value)) })} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
-        </div>
-        <div>
-          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Kết thúc</label>
-          <input type="time" step={TIME_STEP_MIN * 60} value={minToHHMM(editing.e)} onChange={(ev) => setField({ e: roundToStep(hhmmToMin(ev.target.value)) })} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
-        </div>
+        {kind === "once" ? (
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Ngày</label>
+            <input
+              type="date"
+              value={dk}
+              onClick={(e) => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (err) {} }}
+              onChange={(ev) => changeDate(ev.target.value)}
+              className="cursor-pointer rounded-xl border px-2 py-2 text-sm outline-none"
+              style={{ borderColor: BORDER, color: INK }}
+            />
+          </div>
+        ) : (
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Thứ</label>
+            <select value={di} onChange={(ev) => changeWeekday(Number(ev.target.value))} className="rounded-xl border px-2 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK, backgroundColor: "#FFFFFF" }}>
+              {DAYS.map((d, i) => <option key={d.short} value={i}>{d.full}</option>)}
+            </select>
+          </div>
+        )}
+        <TimeField label="Bắt đầu" value={editing.s} onChange={(v) => setTime({ s: v })} />
+        <TimeField label="Kết thúc" value={editing.e} onChange={(v) => setTime({ e: v })} />
         <div className="min-w-[180px] flex-1">
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Đang bận việc gì?</label>
           <input value={editing.note} onChange={(ev) => setField({ note: ev.target.value })} placeholder="VD: Dạy lớp HSK3" className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
@@ -1293,15 +1958,15 @@ function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, last
         </button>
         <button
           onClick={() => {
-            // Huỷ 1 khối vừa kéo (chưa lưu) thì xoá luôn khối đó
             if (editing.isDraft) setMap((prev) => removeBusyBlock(prev, mk, id));
             setEditing(null);
           }}
           className="rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}
         >
-          Huỷ
+          {editing.isDraft ? "Huỷ" : "Đóng"}
         </button>
       </div>
+      {bad && <p className="mt-2 text-[11px]" style={{ color: DANGER }}>Giờ kết thúc phải sau giờ bắt đầu, trong khung {minToHHMM(DAY_START_MIN)} – {minToHHMM(DAY_END_MIN)}.</p>}
 
       <div className="mt-3">
         <label className="mb-1.5 block text-xs" style={{ color: MUTED }}>Lặp lại</label>
@@ -2245,6 +2910,10 @@ function App() {
   const [tags, setTags] = useState(DEFAULT_TAGS);
   // Khung giờ bận chỉ diễn ra 1 lần: { "YYYY-MM-DD": [{ id, s, e, note, tag }] }
   const [busyOnce, setBusyOnce] = useState({});
+  // Google Calendar: cài đặt kết nối + danh sách khối (nhập từ Google) vừa bị xoá trên web
+  const [gcal, setGcal] = useState({ enabled: false, email: null, calendarId: null });
+  const [gcalTrash, setGcalTrash] = useState([]);
+  const [gcalStatus, setGcalStatus] = useState({ state: "idle" });
   // Trung tâm: centerIds = các trung tâm mình tham gia với vai trò giáo viên;
   // ownedCenterId = trung tâm mình làm chủ (nếu có).
   const [centerIds, setCenterIds] = useState([]);
@@ -2281,6 +2950,8 @@ function App() {
         setCenterIds(Array.isArray(data.centerIds) ? data.centerIds : []);
         setTags(normalizeTags(data.tags));
         setBusyOnce(normalizeLoadedBusySlots(data.busyOnce));
+        setGcal(data.gcal && typeof data.gcal === "object" ? { enabled: !!data.gcal.enabled, email: data.gcal.email || null, calendarId: data.gcal.calendarId || null } : { enabled: false, email: null, calendarId: null });
+        setGcalTrash(Array.isArray(data.gcalTrash) ? data.gcalTrash : []);
         // Việc kiểu cũ (hạn theo "thứ") → chuyển sang ngày thật, lưu lại ngay
         const rawTasks = Array.isArray(data.tasks) ? data.tasks : [];
         const loadedTasks = rawTasks.map(migrateTask).filter(Boolean);
@@ -2338,7 +3009,8 @@ function App() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       db.collection("users").doc(user.uid).set({
-        busySlots, busyOnce, tasks,
+        ...clean({ busySlots, busyOnce, tasks }),
+        gcal: clean(gcal), gcalTrash: clean(gcalTrash),
         tags: tags.map(({ id, label, color }) => ({ id, label: label.trim() || "Tag", color })),
         email: user.email || null,
         updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
@@ -2348,7 +3020,204 @@ function App() {
       }).catch(() => notify("Lưu dữ liệu thất bại, kiểm tra kết nối mạng.", "error"));
     }, 600);
     return () => clearTimeout(saveTimer.current);
-  }, [busySlots, busyOnce, tasks, tags, user, dataLoading]);
+  }, [busySlots, busyOnce, tasks, tags, gcal, gcalTrash, user, dataLoading]);
+
+  /* ---------------- Google Calendar: điều phối đồng bộ ---------------- */
+  const gcalRef = useRef({ token: null, syncing: false, again: false, autoRuns: [], prompted: false, requesting: false });
+  const stateRef = useRef({});
+  stateRef.current = { busySlots, busyOnce, tasks, tags, gcal, gcalTrash };
+
+  useEffect(() => { gcalRef.current.token = user ? loadStoredToken(user.uid) : null; gcalRef.current.prompted = false; }, [user]);
+  // Tải sẵn thư viện đăng nhập Google để popup mở được ngay khi bấm
+  useEffect(() => { if (user && GOOGLE_CLIENT_ID) loadGis().catch(() => {}); }, [user]);
+
+  const applyGcalOps = useCallback((ops) => {
+    const mapOps = { weekly: [], once: [] };
+    const taskOps = [];
+    let untrash = null;
+    ops.forEach((op) => {
+      if (op.t === "untrash") untrash = op.keys;
+      else if (op.t === "task" || op.kind === "task") taskOps.push(op);
+      else mapOps[op.kind].push(op);
+    });
+    const applyMap = (list) => (prev) => {
+      let m = { ...prev };
+      for (const op of list) {
+        if (op.t === "addBlock") { m[op.key] = [...(m[op.key] || []), op.block]; continue; }
+        const k = findBlockKey(m, op.id);
+        if (k == null) continue;
+        if (op.t === "delBlock") m[k] = m[k].filter((b) => b.id !== op.id);
+        else if (op.t === "meta") m[k] = m[k].map((b) => (b.id === op.id ? { ...b, g: op.g ? { ...(b.g || {}), ...op.g } : null } : b));
+        else if (op.t === "block") m = moveBusyBlock(m, k, op.key != null ? op.key : k, op.id, op.fields);
+      }
+      return m;
+    };
+    if (mapOps.weekly.length) setBusySlots(applyMap(mapOps.weekly));
+    if (mapOps.once.length) setBusyOnce(applyMap(mapOps.once));
+    if (taskOps.length) {
+      setTasks((prev) => prev.map((t) => {
+        let nt = t;
+        for (const op of taskOps) {
+          if (op.id !== t.id) continue;
+          nt = op.t === "meta" ? { ...nt, g: op.g ? { ...(nt.g || {}), ...op.g } : null } : { ...nt, ...op.fields };
+        }
+        return nt;
+      }));
+    }
+    if (untrash) setGcalTrash((prev) => prev.filter((x) => !untrash.includes(x.key)));
+  }, []);
+
+  const runGcalSync = useCallback(async () => {
+    const g = gcalRef.current;
+    const st = stateRef.current;
+    if (!st.gcal || !st.gcal.enabled) return;
+    if (!g.token || g.token.exp < Date.now()) { setGcalStatus((s) => ({ ...s, state: "needauth" })); return; }
+    if (g.syncing) { g.again = true; return; }
+    g.syncing = true;
+    setGcalStatus((s) => ({ ...s, state: "syncing" }));
+    try {
+      const cal = await ensureGcalCalendar(g.token.token, st.gcal.calendarId);
+      if (cal.id !== st.gcal.calendarId) setGcal((prev) => ({ ...prev, calendarId: cal.id }));
+      // Lịch TNTime vừa được tạo mới (VD: đã bị xoá trên Google) → gửi lại tất cả, không coi là "bị xoá"
+      const { ops, stats } = await gcalSyncCore(g.token.token, cal.id, stateRef.current, cal.created);
+      if (ops.length) applyGcalOps(ops);
+      setGcalStatus({ state: "ok", last: Date.now(), stats });
+    } catch (err) {
+      if (err.status === 401) {
+        g.token = null;
+        if (user) clearStoredToken(user.uid);
+        setGcalStatus((s) => ({ ...s, state: "needauth" }));
+      } else {
+        const notEnabled = err.status === 403 && /has not been used|is disabled|accessNotConfigured/i.test(err.message + " " + (err.reason || ""));
+        setGcalStatus((s) => ({ ...s, state: "error", msg: notEnabled ? "Google Calendar API chưa được bật cho dự án — cần quản trị viên bật trong Google Cloud." : "Đồng bộ lỗi: " + (err.message === "Failed to fetch" ? "không kết nối được Google (kiểm tra mạng / VPN)." : err.message) }));
+      }
+    } finally {
+      g.syncing = false;
+      if (g.again) { g.again = false; setTimeout(() => runGcalSync(), 800); }
+    }
+  }, [applyGcalOps, user]);
+
+  /* Lấy quyền Google (popup) — phải gọi ngay trong 1 cú bấm */
+  const acquireGcalToken = useCallback((interactive) => {
+    const g = gcalRef.current;
+    if (g.requesting) return Promise.reject(new Error("busy"));
+    g.requesting = true;
+    const st = stateRef.current;
+    return requestGcalToken({ hint: st.gcal && st.gcal.email, prompt: interactive ? "select_account" : "" })
+      .then(async (tok) => {
+        const prim = await gapi(tok.token, "GET", "/calendars/primary");
+        tok.email = prim && prim.id;
+        const cur = stateRef.current.gcal || {};
+        if (cur.enabled && cur.email && tok.email && cur.email !== tok.email) {
+          throw Object.assign(new Error(`Bạn vừa chọn tài khoản ${tok.email}, nhưng web đang đồng bộ với ${cur.email}. Hãy chọn đúng tài khoản, hoặc Ngắt kết nối rồi kết nối lại.`), { code: "wrong-account" });
+        }
+        g.token = tok;
+        if (user) storeToken(user.uid, tok);
+        return tok;
+      })
+      .finally(() => { g.requesting = false; });
+  }, [user]);
+
+  const gcalConnect = useCallback(() => {
+    acquireGcalToken(true).then((tok) => {
+      const prev = stateRef.current.gcal || {};
+      if (prev.email && tok.email !== prev.email) {
+        // Đổi sang tài khoản Google khác: bỏ liên kết cũ để không xoá nhầm dữ liệu
+        const strip = (m) => { const o = {}; Object.keys(m || {}).forEach((k) => { o[k] = (m[k] || []).map((b) => ({ ...b, g: null })); }); return o; };
+        setBusySlots(strip);
+        setBusyOnce(strip);
+        setTasks((p) => p.map((t) => ({ ...t, g: null })));
+        setGcalTrash([]);
+      }
+      setGcal({ enabled: true, email: tok.email || null, calendarId: prev.email && tok.email !== prev.email ? null : prev.calendarId || null });
+      notify("Đã kết nối Google Calendar — đang đồng bộ...", "success");
+      setTimeout(() => runGcalSync(), 300);
+    }).catch((err) => {
+      if (err.message === "busy") return;
+      setGcalStatus((s) => ({ ...s, state: "error", msg: err.message }));
+      notify(err.message, "error");
+    });
+  }, [acquireGcalToken, runGcalSync, notify]);
+
+  const gcalSyncNow = useCallback(() => {
+    const g = gcalRef.current;
+    if (g.token && g.token.exp > Date.now()) { runGcalSync(); return; }
+    g.prompted = true;
+    acquireGcalToken(false).then(() => runGcalSync()).catch((err) => {
+      if (err.message === "busy") return;
+      setGcalStatus((s) => ({ ...s, state: err.code === "wrong-account" ? "error" : "needauth", msg: err.message }));
+      if (err.code === "wrong-account") notify(err.message, "error");
+    });
+  }, [acquireGcalToken, runGcalSync, notify]);
+
+  const gcalDisconnect = useCallback(() => {
+    if (!window.confirm("Ngắt kết nối Google Calendar?\nDữ liệu trên web và lịch “TNTime” trên Google vẫn được giữ nguyên, chỉ ngừng đồng bộ.")) return;
+    const g = gcalRef.current;
+    try { if (g.token && window.google && window.google.accounts) window.google.accounts.oauth2.revoke(g.token.token, () => {}); } catch (e) {}
+    g.token = null;
+    if (user) clearStoredToken(user.uid);
+    setGcal((prev) => ({ ...prev, enabled: false }));
+    setGcalStatus({ state: "idle" });
+  }, [user]);
+
+  const gcalTrashBlock = useCallback((kind, block) => {
+    if (!block || !block.g || block.g.src !== "import") return;
+    setGcalTrash((prev) => (prev.some((x) => x.key === block.g.key) ? prev : [...prev, { kind, key: block.g.key, id: block.g.id, day: block.g.day == null ? null : block.g.day }]));
+  }, []);
+
+  // Tự đồng bộ: sau khi sửa trên web (chờ 4 giây), mỗi 3 phút, và khi quay lại tab
+  useEffect(() => {
+    if (!user || dataLoading || !gcal.enabled) return;
+    const t = setTimeout(() => {
+      // Chốt an toàn: tối đa 8 lượt tự động / phút (tránh vòng lặp đồng bộ)
+      const g = gcalRef.current;
+      const now = Date.now();
+      g.autoRuns = g.autoRuns.filter((x) => now - x < 60000);
+      if (g.autoRuns.length >= 8) return;
+      g.autoRuns.push(now);
+      runGcalSync();
+    }, 4000);
+    return () => clearTimeout(t);
+  }, [busySlots, busyOnce, tasks, tags, gcalTrash, gcal.enabled, user, dataLoading, runGcalSync]);
+  useEffect(() => {
+    if (!user || dataLoading || !gcal.enabled) return;
+    const iv = setInterval(() => runGcalSync(), 3 * 60 * 1000);
+    const onVis = () => { if (document.visibilityState === "visible") runGcalSync(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", onVis); };
+  }, [gcal.enabled, user, dataLoading, runGcalSync]);
+  // Mở web mà chưa có quyền Google trong phiên này → lần bấm đầu tiên sẽ xin quyền
+  useEffect(() => {
+    if (!user || dataLoading || !gcal.enabled) return;
+    const onDown = (e) => {
+      const g = gcalRef.current;
+      if (g.prompted || g.requesting || (g.token && g.token.exp > Date.now())) return;
+      if (e.target && e.target.closest && e.target.closest("[data-gcal-btn]")) return;
+      g.prompted = true;
+      acquireGcalToken(false).then(() => runGcalSync()).catch((err) => {
+        if (err.message === "busy") return;
+        setGcalStatus((s) => ({ ...s, state: err.code === "wrong-account" ? "error" : "needauth", msg: err.message }));
+      });
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    return () => window.removeEventListener("pointerdown", onDown, true);
+  }, [gcal.enabled, user, dataLoading, acquireGcalToken, runGcalSync]);
+  useEffect(() => {
+    if (user && !dataLoading && gcal.enabled && gcalRef.current.token && gcalRef.current.token.exp > Date.now()) runGcalSync();
+    else if (user && !dataLoading && gcal.enabled) setGcalStatus((s) => ({ ...s, state: "needauth" }));
+  }, [user, dataLoading]); // eslint-disable-line
+
+  const gcalCtx = {
+    configured: !!GOOGLE_CLIENT_ID,
+    enabled: !!gcal.enabled,
+    email: gcal.email,
+    status: gcalStatus,
+    connect: gcalConnect,
+    syncNow: gcalSyncNow,
+    disconnect: gcalDisconnect,
+    trashBlock: gcalTrashBlock,
+  };
+
 
   /* Đồng bộ khung giờ bận cá nhân vào từng trung tâm mình đang tham gia (với
      vai trò giáo viên), để chủ trung tâm xem được lịch rảnh khi xếp lớp.
@@ -2358,7 +3227,7 @@ function App() {
     const t = setTimeout(() => {
       centerIds.forEach((cid) => {
         db.collection("centers").doc(cid).collection("members").doc(user.uid).set({
-          busySlots, email: user.email || null, role: "teacher", status: "active",
+          busySlots: clean(busySlots), email: user.email || null, role: "teacher", status: "active",
           updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
         }, { merge: true }).catch(() => {});
       });
@@ -2375,6 +3244,10 @@ function App() {
     setTasks([]);
     setTags(DEFAULT_TAGS);
     setBusyOnce({});
+    setGcal({ enabled: false, email: null, calendarId: null });
+    setGcalTrash([]);
+    setGcalStatus({ state: "idle" });
+    gcalRef.current.token = null;
     setDataLoading(true);
   };
 
@@ -2422,6 +3295,7 @@ function App() {
                 <Save size={11} /> {justSaved ? "đã lưu" : "tự động lưu"}
               </span>
               {user?.email && <span style={{ color: MUTED_LIGHT }}>· {user.email}</span>}
+              <GcalContext.Provider value={gcalCtx}><GcalChip /></GcalContext.Provider>
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -2449,6 +3323,7 @@ function App() {
       </header>
 
       <TagsContext.Provider value={tags}>
+      <GcalContext.Provider value={gcalCtx}>
       <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
         {view === "dashboard" && <DashboardView busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onDropTask={handleDropTask} />}
         {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} tasks={tasks} setTags={setTags} notify={notify} />}
@@ -2464,6 +3339,7 @@ function App() {
         )}
         {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} busySlots={busySlots} busyOnce={busyOnce} notify={notify} />}
       </main>
+      </GcalContext.Provider>
       </TagsContext.Provider>
 
       <Toast toast={toast} onClose={() => setToast(null)} />
