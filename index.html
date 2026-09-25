@@ -455,58 +455,125 @@ function normalizeLoadedBusySlots(raw) {
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Scheduling helpers                                                    */
+/*  Ngày tháng — lịch theo NGÀY THẬT (tuần bắt đầu từ Thứ 2)               */
 /* ---------------------------------------------------------------------- */
 
-function canPlace(busySlots, occupied, day, start, duration, excludeId) {
-  if (start + duration > HOUR_END + 1) return false;
-  if (!isRangeFreeOfBusy(busySlots, day, start * 60, (start + duration) * 60)) return false;
-  for (let i = 0; i < duration; i++) {
-    const k = key(day, start + i);
-    if (occupied[k] && occupied[k] !== excludeId) return false;
+const PLAN_WINDOW_DAYS = 30;   // cho phép sắp xếp việc trong vòng 1 tháng tới
+const PLAN_STEP_MIN = 30;      // việc cần làm: bước 30 phút
+const DURATION_OPTIONS = Array.from({ length: 16 }, (_, i) => (i + 1) / 2); // 0.5h … 8h
+
+const pad2 = (n) => String(n).padStart(2, "0");
+function dateKey(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+function parseKey(k) { const [y, m, d] = String(k || "").split("-").map(Number); return new Date(y || 1970, (m || 1) - 1, d || 1); }
+function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+function addDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n); }
+function weekdayIdx(d) { return (d.getDay() + 6) % 7; } // Thứ 2 = 0 … CN = 6
+function startOfWeek(d) { const x = startOfDay(d); return addDays(x, -weekdayIdx(x)); }
+function todayKey() { return dateKey(new Date()); }
+function fmtDM(d) { return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}`; }
+function fmtDateLabel(k) { const d = parseKey(k); return `${DAYS[weekdayIdx(d)].full}, ${fmtDM(d)}`; }
+function nowMinutes() { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); }
+function roundTo(min, step) { return Math.round(min / step) * step; }
+function formatHours(h) { return formatDuration(Math.round(h * 60)); }
+
+/* Tất cả khối bận của 1 ngày cụ thể = khối lặp hằng tuần (theo thứ)
+   + khối chỉ diễn ra 1 lần vào đúng ngày đó. */
+function busyForDate(busySlots, busyOnce, dk, di) {
+  return [
+    ...(busySlots[di] || []).map((b) => ({ ...b, kind: "weekly" })),
+    ...((busyOnce || {})[dk] || []).map((b) => ({ ...b, kind: "once" })),
+  ];
+}
+
+function freeMinutesForDate(busySlots, busyOnce, d) {
+  const list = busyForDate(busySlots, busyOnce, dateKey(d), weekdayIdx(d));
+  const busy = normalizeIntervals(list).reduce((s, [a, b]) => s + (b - a), 0);
+  return Math.max(0, DAY_TOTAL_MIN - busy);
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Việc cần làm — theo ngày thật, bước 30 phút                           */
+/*  { id, name, category, duration (giờ, bước 0.5), deadlineDate,          */
+/*    deadlineMin, status, scheduledDate, scheduledStart (phút), v: 2 }    */
+/* ---------------------------------------------------------------------- */
+
+/* Chuyển việc kiểu cũ (hạn theo "thứ", giờ chẵn) sang kiểu mới theo ngày
+   của TUẦN HIỆN TẠI, để không mất dữ liệu cũ. */
+function migrateTask(t) {
+  if (!t || typeof t !== "object") return null;
+  if (t.v === 2) {
+    return { ...t, duration: Number(t.duration) || 1, deadlineMin: Number(t.deadlineMin) || 18 * 60, scheduledStart: t.scheduledStart == null ? null : Number(t.scheduledStart) };
   }
-  return true;
+  const base = startOfWeek(new Date());
+  const out = {
+    id: t.id || uid(), name: t.name || "Việc", category: t.category || "khac",
+    duration: Number(t.duration) || 1,
+    deadlineDate: dateKey(addDays(base, Number.isFinite(Number(t.deadlineDay)) ? Number(t.deadlineDay) : 6)),
+    deadlineMin: (Number(t.deadlineHour) || 18) * 60,
+    status: t.status === "scheduled" ? "scheduled" : (t.status === "unscheduled" ? "unscheduled" : "pending"),
+    scheduledDate: null, scheduledStart: null, v: 2,
+  };
+  if (out.status === "scheduled" && t.scheduledDay != null && t.scheduledStart != null) {
+    out.scheduledDate = dateKey(addDays(base, Number(t.scheduledDay)));
+    const st = Number(t.scheduledStart);
+    out.scheduledStart = st <= 24 ? st * 60 : st;
+  } else if (out.status === "scheduled") {
+    out.status = "pending";
+  }
+  return out;
 }
 
-function buildOccupied(tasks, excludeId) {
-  const occ = {};
-  tasks.forEach((t) => {
-    if (t.status === "scheduled" && t.id !== excludeId) {
-      for (let i = 0; i < t.duration; i++) occ[key(t.scheduledDay, t.scheduledStart + i)] = t.id;
-    }
-  });
-  return occ;
+const taskMinutes = (t) => Math.round((Number(t.duration) || 0) * 60);
+
+/* Khoảng [s, e) của ngày dk có trống không (tính cả khối bận & việc đã xếp) */
+function isSlotFree(busySlots, busyOnce, tasks, dk, s, e, excludeTaskId) {
+  if (s < DAY_START_MIN || e > DAY_END_MIN || e <= s) return false;
+  const di = weekdayIdx(parseKey(dk));
+  if (busyForDate(busySlots, busyOnce, dk, di).some((b) => b.s < e && b.e > s)) return false;
+  return !tasks.some((t) => t.status === "scheduled" && t.id !== excludeTaskId && t.scheduledDate === dk
+    && t.scheduledStart < e && t.scheduledStart + taskMinutes(t) > s);
 }
 
-function autoSchedule(tasks, busySlots) {
-  const occupied = buildOccupied(tasks, null);
-  const pending = tasks
+/* Kiểm tra 1 vị trí đặt việc có hợp lệ không; trả về chuỗi lỗi hoặc null */
+function placementError(busySlots, busyOnce, tasks, task, dk, s) {
+  const e = s + taskMinutes(task);
+  if (s < DAY_START_MIN || e > DAY_END_MIN) return `Chỉ có thể xếp trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`;
+  const tk = todayKey();
+  if (dk < tk || (dk === tk && s < nowMinutes())) return "Không thể xếp vào thời điểm đã qua.";
+  if (dk > task.deadlineDate || (dk === task.deadlineDate && e > task.deadlineMin)) return `Quá hạn chót (${fmtDateLabel(task.deadlineDate)} ${minToHHMM(task.deadlineMin)}).`;
+  if (!isSlotFree(busySlots, busyOnce, tasks, dk, s, e, task.id)) return "Trùng lịch — khung giờ này đã bận hoặc có việc khác.";
+  return null;
+}
+
+function autoSchedule(tasks, busySlots, busyOnce) {
+  const working = tasks.map((t) => ({ ...t }));
+  const today = startOfDay(new Date());
+  const tk = dateKey(today);
+  const nowM = nowMinutes();
+  const pending = working
     .filter((t) => t.status !== "scheduled")
-    .slice()
-    .sort((a, b) => {
-      const da = a.deadlineDay * 100 + a.deadlineHour;
-      const db = b.deadlineDay * 100 + b.deadlineHour;
-      if (da !== db) return da - db;
-      return b.duration - a.duration;
-    });
+    .sort((a, b) => (a.deadlineDate + pad2(Math.floor(a.deadlineMin / 60)) + pad2(a.deadlineMin % 60)).localeCompare(b.deadlineDate + pad2(Math.floor(b.deadlineMin / 60)) + pad2(b.deadlineMin % 60)) || b.duration - a.duration);
 
   const results = {};
   pending.forEach((t) => {
+    const dm = taskMinutes(t);
     let placed = false;
-    for (let day = 0; day <= t.deadlineDay && !placed; day++) {
-      const upperBound = day === t.deadlineDay
-        ? Math.min(HOUR_END - t.duration + 1, t.deadlineHour - t.duration)
-        : HOUR_END - t.duration + 1;
-      for (let h = HOUR_START; h <= upperBound; h++) {
-        if (canPlace(busySlots, occupied, day, h, t.duration, null)) {
-          for (let i = 0; i < t.duration; i++) occupied[key(day, h + i)] = t.id;
-          results[t.id] = { scheduledDay: day, scheduledStart: h, status: "scheduled" };
+    for (let i = 0; i <= PLAN_WINDOW_DAYS && !placed; i++) {
+      const dk = dateKey(addDays(today, i));
+      if (dk > t.deadlineDate) break;
+      const minStart = dk === tk ? Math.max(DAY_START_MIN, Math.ceil(nowM / PLAN_STEP_MIN) * PLAN_STEP_MIN) : DAY_START_MIN;
+      const maxEnd = dk === t.deadlineDate ? Math.min(DAY_END_MIN, t.deadlineMin) : DAY_END_MIN;
+      for (let s = minStart; s + dm <= maxEnd; s += PLAN_STEP_MIN) {
+        if (isSlotFree(busySlots, busyOnce, working, dk, s, s + dm, t.id)) {
+          const r = { status: "scheduled", scheduledDate: dk, scheduledStart: s };
+          Object.assign(t, r);
+          results[t.id] = r;
           placed = true;
           break;
         }
       }
     }
-    if (!placed) results[t.id] = { scheduledDay: null, scheduledStart: null, status: "unscheduled" };
+    if (!placed) results[t.id] = { status: "unscheduled", scheduledDate: null, scheduledStart: null };
   });
   return results;
 }
@@ -553,135 +620,186 @@ function Toast({ toast, onClose }) {
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Week grid — shared between Slot Editor & Dashboard                    */
+/*  Lịch: trạng thái xem (tuần / tháng), chuyển tuần, phóng to thu nhỏ     */
+/*  - Chụm 2 ngón (trackpad hoặc màn hình cảm ứng) để thu nhỏ: tuần → tháng */
+/*  - Giãn 2 ngón để phóng to: tháng → tuần, tuần → giãn cao các giờ        */
 /* ---------------------------------------------------------------------- */
 
-function WeekGrid({ busySlots, tasks, onDropTask, selectedTaskId, onSelectTask }) {
-  const tags = useTags();
-  const rowH = 34;
-  const labelW = 54;
-  const [dragOverKey, setDragOverKey] = useState(null);
+const ROW_MIN = 20;
+const ROW_MAX = 72;
+
+function useCalendarState() {
+  const [mode, setMode] = useState("week");
+  const [anchor, setAnchor] = useState(() => startOfDay(new Date()));
+  const [rowH, setRowH] = useState(34);
+  const weekStart = startOfWeek(anchor);
+  const dates = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  return { mode, setMode, anchor, setAnchor, rowH, setRowH, weekStart, dates };
+}
+
+const ChevronLeft = makeIcon(<path d="M15 5l-7 7 7 7" />);
+const ChevronRight = makeIcon(<path d="M9 5l7 7-7 7" />);
+const ZoomIn = makeIcon(<><circle cx="11" cy="11" r="6.5" /><path d="M16 16l4.5 4.5" /><path d="M11 8v6" /><path d="M8 11h6" /></>);
+const ZoomOut = makeIcon(<><circle cx="11" cy="11" r="6.5" /><path d="M16 16l4.5 4.5" /><path d="M8 11h6" /></>);
+
+function CalendarPanel({ cal, children }) {
+  const wrapRef = useRef(null);
+  const calRef = useRef(cal);
+  calRef.current = cal;
+
+  const zoomBy = useCallback((ratio, x, y, st) => {
+    const now = Date.now();
+    if (now < st.lock) return;
+    const c = calRef.current;
+    if (c.mode === "week") {
+      if (ratio < 1 && c.rowH <= ROW_MIN + 0.5) {
+        st.acc *= ratio;
+        if (st.acc < 0.8) { st.acc = 1; st.lock = now + 550; c.setMode("month"); }
+        return;
+      }
+      st.acc = 1;
+      c.setRowH((h) => Math.max(ROW_MIN, Math.min(ROW_MAX, h * ratio)));
+    } else {
+      if (ratio > 1) {
+        st.acc *= ratio;
+        if (st.acc > 1.25) {
+          st.acc = 1; st.lock = now + 550;
+          const cell = x != null ? document.elementFromPoint(x, y)?.closest?.("[data-date]") : null;
+          if (cell) c.setAnchor(parseKey(cell.dataset.date));
+          c.setRowH(ROW_MIN + 8);
+          c.setMode("week");
+        }
+      } else st.acc = 1;
+    }
+  }, []);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const st = { acc: 1, lock: 0, lastDist: null, gScale: 1, gActive: false };
+    // Trackpad (Chrome/Edge/Firefox): chụm 2 ngón = sự kiện wheel kèm ctrlKey
+    const onWheel = (e) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      if (st.gActive) return;
+      zoomBy(Math.exp(-e.deltaY * 0.012), e.clientX, e.clientY, st);
+    };
+    // Safari trên Mac: sự kiện gesture*
+    const onGStart = (e) => { e.preventDefault(); st.gActive = true; st.gScale = e.scale || 1; };
+    const onGChange = (e) => { e.preventDefault(); const sc = e.scale || 1; zoomBy(sc / st.gScale, e.clientX, e.clientY, st); st.gScale = sc; };
+    const onGEnd = (e) => { e.preventDefault(); st.gActive = false; };
+    // Màn hình cảm ứng (điện thoại / iPad): 2 ngón
+    const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const onTStart = (e) => { if (e.touches.length === 2) st.lastDist = dist(e.touches); };
+    const onTMove = (e) => {
+      if (e.touches.length !== 2 || !st.lastDist) return;
+      e.preventDefault();
+      const d = dist(e.touches);
+      const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2, my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      zoomBy(d / st.lastDist, mx, my, st);
+      st.lastDist = d;
+    };
+    const onTEnd = (e) => { if (e.touches.length < 2) st.lastDist = null; };
+    const opts = { passive: false };
+    el.addEventListener("wheel", onWheel, opts);
+    el.addEventListener("gesturestart", onGStart, opts);
+    el.addEventListener("gesturechange", onGChange, opts);
+    el.addEventListener("gestureend", onGEnd, opts);
+    el.addEventListener("touchstart", onTStart, opts);
+    el.addEventListener("touchmove", onTMove, opts);
+    el.addEventListener("touchend", onTEnd, opts);
+    return () => {
+      el.removeEventListener("wheel", onWheel, opts);
+      el.removeEventListener("gesturestart", onGStart, opts);
+      el.removeEventListener("gesturechange", onGChange, opts);
+      el.removeEventListener("gestureend", onGEnd, opts);
+      el.removeEventListener("touchstart", onTStart, opts);
+      el.removeEventListener("touchmove", onTMove, opts);
+      el.removeEventListener("touchend", onTEnd, opts);
+    };
+  }, [zoomBy]);
+
+  const isWeek = cal.mode === "week";
+  const step = (dir) => {
+    if (isWeek) cal.setAnchor((a) => addDays(a, 7 * dir));
+    else cal.setAnchor((a) => new Date(a.getFullYear(), a.getMonth() + dir, 1));
+  };
+  const label = isWeek
+    ? `${fmtDM(cal.dates[0])} – ${fmtDM(cal.dates[6])}/${cal.dates[6].getFullYear()}`
+    : `Tháng ${cal.anchor.getMonth() + 1}/${cal.anchor.getFullYear()}`;
+  const btn = "flex h-8 items-center justify-center rounded-full border px-2.5 text-xs font-medium hover:bg-[#FFF6FA]";
+  const manualZoom = (ratio) => zoomBy(ratio, null, null, { acc: ratio < 1 ? 0.7 : 1.3, lock: 0 });
 
   return (
-    <div className="overflow-x-auto">
-      <div className="grid select-none" style={{ gridTemplateColumns: `${labelW}px repeat(7, minmax(64px, 1fr))`, gridTemplateRows: `32px repeat(${HOURS.length}, ${rowH}px) 16px`, minWidth: 640 }}>
-        <div style={{ gridColumn: 1, gridRow: 1 }} />
-        {DAYS.map((d, di) => (
-          <div key={d.short} className="flex items-end justify-center pb-1 text-xs font-semibold" style={{ gridColumn: di + 2, gridRow: 1, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
-        ))}
-        {HOURS.map((h, hi) => (
-          <div key={"lbl-" + h} className="flex items-start justify-end pr-2 text-[11px]" style={{ gridColumn: 1, gridRow: hi + 2, color: MUTED_LIGHT, transform: "translateY(-6px)" }}>{h}:00</div>
-        ))}
-        <div className="flex items-start justify-end pr-2 text-[11px]" style={{ gridColumn: 1, gridRow: HOURS.length + 2, color: MUTED_LIGHT, transform: "translateY(-6px)" }}>{HOUR_END + 1}:00</div>
-        {DAYS.map((d, di) =>
-          HOURS.map((h, hi) => {
-            const k = key(di, h);
-            const startMin = h * 60, endMin = (h + 1) * 60;
-            const segs = busySegmentsInRange(busySlots, di, startMin, endMin);
-            const isOver = dragOverKey === k;
-            return (
-              <div
-                key={k}
-                onDragOver={(e) => { e.preventDefault(); setDragOverKey(k); }}
-                onDragLeave={() => setDragOverKey((prev) => (prev === k ? null : prev))}
-                onDrop={(e) => { e.preventDefault(); setDragOverKey(null); onDropTask(di, h); }}
-                style={{
-                  position: "relative",
-                  gridColumn: di + 2, gridRow: hi + 2,
-                  backgroundColor: "#FFFCFD",
-                  borderTop: "1px solid #FBEAF1",
-                  borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7",
-                  borderRight: "1px solid #FDF3F7",
-                  outline: isOver ? "2px dashed " + SECONDARY : "none",
-                  outlineOffset: "-2px",
-                  overflow: "hidden",
-                }}
-              >
-                {segs.map((seg, si) => (
-                  <div
-                    key={si}
-                    title={[busyStyleOf(tags, seg.tag).label, seg.note].filter(Boolean).join(" · ") || "Bận"}
-                    style={{
-                      position: "absolute", left: 0, right: 0,
-                      top: `${((seg.os - startMin) / 60) * 100}%`,
-                      height: `${((seg.oe - seg.os) / 60) * 100}%`,
-                      backgroundColor: seg.tag && findTag(tags, seg.tag) ? busyStyleOf(tags, seg.tag).bg : (isOver ? "#F3C9D6" : "#F3DDE5"),
-                      opacity: isOver ? 0.7 : 1,
-                    }}
-                  />
-                ))}
-              </div>
-            );
-          })
-        )}
-        {tasks.filter((t) => t.status === "scheduled").map((t) => {
-          const c = catOfTask(tags, t.category);
-          const selected = selectedTaskId === t.id;
-          return (
-            <div
-              key={t.id}
-              draggable
-              onDragStart={(e) => e.dataTransfer.setData("text/plain", t.id)}
-              onClick={() => onSelectTask(t.id)}
-              title={`${t.name} · ${t.duration}h`}
-              className="z-10 mx-0.5 my-0.5 flex cursor-grab items-center gap-1 overflow-hidden rounded-xl border px-1.5 text-[11px] font-medium leading-tight active:cursor-grabbing"
-              style={{ gridColumn: t.scheduledDay + 2, gridRow: `${HOURS.indexOf(t.scheduledStart) + 2} / span ${t.duration}`, backgroundColor: c.bg, borderColor: selected ? c.text : c.border, borderWidth: selected ? 2 : 1, color: c.text, boxShadow: selected ? "0 0 0 2px " + c.bg : "none" }}
-            >
-              <GripVertical size={11} className="shrink-0 opacity-50" />
-              <span className="truncate">{t.name}</span>
-            </div>
-          );
-        })}
+    <div>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <button onClick={() => step(-1)} className={btn} style={{ borderColor: BORDER, color: INK }} title={isWeek ? "Tuần trước" : "Tháng trước"}><ChevronLeft size={15} /></button>
+        <button onClick={() => cal.setAnchor(startOfDay(new Date()))} className={btn} style={{ borderColor: BORDER, color: INK }}>Hôm nay</button>
+        <button onClick={() => step(1)} className={btn} style={{ borderColor: BORDER, color: INK }} title={isWeek ? "Tuần sau" : "Tháng sau"}><ChevronRight size={15} /></button>
+        <span className="ml-1 text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{label}</span>
+        <div className="ml-auto flex items-center gap-1.5">
+          <button onClick={() => manualZoom(0.8)} className={btn} style={{ borderColor: BORDER, color: MUTED }} title="Thu nhỏ"><ZoomOut size={15} /></button>
+          <button onClick={() => manualZoom(1.25)} className={btn} style={{ borderColor: BORDER, color: MUTED }} title="Phóng to"><ZoomIn size={15} /></button>
+          <div className="flex rounded-full border p-0.5" style={{ borderColor: BORDER }}>
+            {[["week", "Tuần"], ["month", "Tháng"]].map(([m, l]) => (
+              <button key={m} onClick={() => cal.setMode(m)} className="rounded-full px-3 py-1 text-xs font-semibold" style={{ backgroundColor: cal.mode === m ? PRIMARY : "transparent", color: cal.mode === m ? "#FFFFFF" : "#8A6070" }}>{l}</button>
+            ))}
+          </div>
+        </div>
       </div>
+      <p className="mb-2 text-[11px]" style={{ color: MUTED_LIGHT }}>Chụm 2 ngón để thu nhỏ (xem cả tháng) · giãn 2 ngón để phóng to (xem tuần, giãn rộng giờ)</p>
+      <div ref={wrapRef} style={{ touchAction: "pan-x pan-y" }}>{children}</div>
     </div>
   );
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Lịch chỉnh khung giờ bận — kéo chuột trực tiếp, chính xác tới 5 phút   */
+/*  Lịch tuần theo ngày thật                                              */
+/*  mode="edit": kéo chuột tạo / chỉnh khung giờ bận, việc đã xếp chỉ xem  */
+/*  mode="plan": khung bận chỉ xem, kéo thả việc cần làm để đổi giờ        */
 /* ---------------------------------------------------------------------- */
 
-function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock }) {
+function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateDraft, onSelectBlock, onResizeBlock, onDropTask, selectedTaskId, onSelectTask }) {
   const tags = useTags();
-  const rowH = 34;
+  const editable = mode === "edit";
   const labelW = 54;
   const pxPerMin = rowH / 60;
+  const pxRef = useRef(pxPerMin);
+  pxRef.current = pxPerMin;
   const totalHeight = HOURS.length * rowH;
-  const dragRef = useRef(null); // { day, startMin, top }
-  const [draft, setDraft] = useState(null); // { day, s, e }
-  const resizeRef = useRef(null); // { day, id, edge, top, fixedS, fixedE }
-  const [resize, setResize] = useState(null); // { day, id, s, e } — xem trước khi đang kéo chỉnh
+  const tk = todayKey();
 
-  // Giữ giá trị xem-trước mới nhất trong ref (song song với state chỉ để vẽ),
-  // để lúc thả chuột đọc trực tiếp từ ref thay vì đọc qua callback của setState
-  // (gọi callback cha bên trong updater của setState là nguyên nhân gây lỗi
-  // React #185 "Maximum update depth exceeded").
+  const dragRef = useRef(null);
+  const [draft, setDraft] = useState(null);
   const draftValueRef = useRef(null);
+  const resizeRef = useRef(null);
+  const [resize, setResize] = useState(null);
   const resizeValueRef = useRef(null);
+  const draggingTaskRef = useRef(null);
+  const [dropHint, setDropHint] = useState(null); // { dk, s, e }
 
-  const minuteAtY = (y) => {
-    const raw = DAY_START_MIN + y / pxPerMin;
-    return Math.min(DAY_END_MIN, Math.max(DAY_START_MIN, roundToStep(raw)));
+  const minuteAtY = (y, step = TIME_STEP_MIN, floor = false) => {
+    const raw = DAY_START_MIN + y / pxRef.current;
+    const r = floor ? Math.floor(raw / step) * step : roundTo(raw, step);
+    return Math.min(DAY_END_MIN, Math.max(DAY_START_MIN, r));
   };
 
-  const handleMouseDown = (day) => (e) => {
-    if (e.target !== e.currentTarget) return; // bấm vào khối đã có, để xử lý riêng (kéo mép / bấm mở form)
+  const handleMouseDown = (dk, di) => (e) => {
+    if (!editable || e.button !== 0) return;
+    if (e.target !== e.currentTarget) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const m = minuteAtY(e.clientY - rect.top);
-    dragRef.current = { day, startMin: m, top: rect.top };
-    const next = { day, s: m, e: m };
+    dragRef.current = { dk, di, startMin: m, top: rect.top };
+    const next = { dk, di, s: m, e: m };
     draftValueRef.current = next;
     setDraft(next);
   };
 
-  // Kéo mép trên/dưới của 1 khối đã có để chỉnh lại giờ bắt đầu/kết thúc —
-  // dùng khi kéo lố vài phút và muốn sửa lại ngay trên lịch, không cần gõ tay.
-  const handleResizeStart = (day, block, edge) => (e) => {
+  const handleResizeStart = (dk, di, block, edge) => (e) => {
     e.stopPropagation();
-    const colEl = e.currentTarget.closest(".daycol");
-    const rect = colEl.getBoundingClientRect();
-    resizeRef.current = { day, id: block.id, edge, top: rect.top, fixedS: block.s, fixedE: block.e };
-    const next = { day, id: block.id, s: block.s, e: block.e };
+    const rect = e.currentTarget.closest(".daycol").getBoundingClientRect();
+    resizeRef.current = { dk, di, block, edge, top: rect.top };
+    const next = { id: block.id, s: block.s, e: block.e };
     resizeValueRef.current = next;
     setResize(next);
   };
@@ -689,24 +807,19 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
   useEffect(() => {
     const handleMove = (e) => {
       if (dragRef.current) {
-        const { day, startMin, top } = dragRef.current;
+        const { dk, di, startMin, top } = dragRef.current;
         const m = minuteAtY(e.clientY - top);
-        const next = { day, s: Math.min(startMin, m), e: Math.max(startMin, m) };
+        const next = { dk, di, s: Math.min(startMin, m), e: Math.max(startMin, m) };
         draftValueRef.current = next;
         setDraft(next);
         return;
       }
       if (resizeRef.current) {
-        const { day, id, edge, top, fixedS, fixedE } = resizeRef.current;
+        const { block, edge, top } = resizeRef.current;
         const m = minuteAtY(e.clientY - top);
-        let next;
-        if (edge === "start") {
-          const newS = Math.max(DAY_START_MIN, Math.min(m, fixedE - TIME_STEP_MIN));
-          next = { day, id, s: newS, e: fixedE };
-        } else {
-          const newE = Math.min(DAY_END_MIN, Math.max(m, fixedS + TIME_STEP_MIN));
-          next = { day, id, s: fixedS, e: newE };
-        }
+        const next = edge === "start"
+          ? { id: block.id, s: Math.max(DAY_START_MIN, Math.min(m, block.e - TIME_STEP_MIN)), e: block.e }
+          : { id: block.id, s: block.s, e: Math.min(DAY_END_MIN, Math.max(m, block.s + TIME_STEP_MIN)) };
         resizeValueRef.current = next;
         setResize(next);
       }
@@ -717,14 +830,15 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
         const d = draftValueRef.current;
         draftValueRef.current = null;
         setDraft(null);
-        if (d && d.e - d.s >= TIME_STEP_MIN) onCreateDraft(d.day, d.s, d.e);
+        if (d && d.e - d.s >= TIME_STEP_MIN && onCreateDraft) onCreateDraft(d.dk, d.di, d.s, d.e);
       }
       if (resizeRef.current) {
+        const { dk, di, block } = resizeRef.current;
         resizeRef.current = null;
         const r = resizeValueRef.current;
         resizeValueRef.current = null;
         setResize(null);
-        if (r) onResizeBlock(r.day, r.id, { s: r.s, e: r.e });
+        if (r && onResizeBlock) onResizeBlock(block, dk, di, { s: r.s, e: r.e });
       }
     };
     window.addEventListener("mousemove", handleMove);
@@ -735,11 +849,31 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
     };
   }, [onCreateDraft, onResizeBlock]);
 
+  const colDragOver = (dk) => (e) => {
+    if (editable) return;
+    e.preventDefault();
+    const t = draggingTaskRef.current;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const s = minuteAtY(e.clientY - rect.top, PLAN_STEP_MIN, true);
+    const dur = t ? taskMinutes(t) : 60;
+    setDropHint((prev) => (prev && prev.dk === dk && prev.s === s ? prev : { dk, s, e: s + dur }));
+  };
+  const colDrop = (dk) => (e) => {
+    if (editable) return;
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const s = minuteAtY(e.clientY - rect.top, PLAN_STEP_MIN, true);
+    const id = e.dataTransfer.getData("text/plain") || selectedTaskId;
+    setDropHint(null);
+    draggingTaskRef.current = null;
+    if (id && onDropTask) onDropTask(id, dk, s);
+  };
+
   return (
     <div className="overflow-x-auto">
       <div className="flex select-none" style={{ minWidth: 640 }}>
         <div style={{ width: labelW, flexShrink: 0 }}>
-          <div style={{ height: 24 }} />
+          <div style={{ height: 36 }} />
           <div style={{ position: "relative", height: totalHeight }}>
             {HOURS.map((h) => (
               <div key={h} style={{ position: "absolute", top: (h - HOUR_START) * rowH - 6, right: 6, fontSize: 11, color: MUTED_LIGHT }}>{h}:00</div>
@@ -747,61 +881,165 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
             <div style={{ position: "absolute", top: totalHeight - 6, right: 6, fontSize: 11, color: MUTED_LIGHT }}>{HOUR_END + 1}:00</div>
           </div>
         </div>
-        {DAYS.map((d, di) => (
-          <div key={d.short} style={{ flex: 1, minWidth: 64 }}>
-            <div className="flex items-end justify-center pb-1 text-xs font-semibold" style={{ height: 24, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
-            <div
-              className="daycol"
-              onMouseDown={handleMouseDown(di)}
-              style={{
-                position: "relative", height: totalHeight, cursor: "crosshair",
-                backgroundColor: "#FFFCFD",
-                backgroundImage: `repeating-linear-gradient(to bottom, #FBEAF1 0, #FBEAF1 1px, transparent 1px, transparent ${rowH}px)`,
-                borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7",
-                borderRight: "1px solid #FDF3F7",
-              }}
-            >
-              {(busySlots[di] || []).map((b) => {
-                const live = resize && resize.day === di && resize.id === b.id ? resize : b;
-                const bs = busyStyleOf(tags, b.tag);
-                return (
-                  <div
-                    key={b.id}
-                    onMouseDown={(e) => e.stopPropagation()}
-                    onClick={(e) => { e.stopPropagation(); onSelectBlock(di, b); }}
-                    title={[bs.label, b.note].filter(Boolean).join(" · ") || "Bận"}
-                    className="absolute left-0.5 right-0.5 cursor-pointer overflow-hidden rounded-md border px-1.5 py-0.5 text-[10.5px] leading-tight hover:brightness-95"
-                    style={{ top: (live.s - DAY_START_MIN) * pxPerMin, height: Math.max(8, (live.e - live.s) * pxPerMin), backgroundColor: bs.bg, borderColor: bs.border, borderLeftWidth: 3, color: bs.text }}
-                  >
+        {dates.map((d) => {
+          const dk = dateKey(d);
+          const di = weekdayIdx(d);
+          const isToday = dk === tk;
+          const isPast = dk < tk;
+          const blocks = busyForDate(busySlots, busyOnce, dk, di);
+          const dayTasks = tasks.filter((t) => t.status === "scheduled" && t.scheduledDate === dk);
+          return (
+            <div key={dk} style={{ flex: 1, minWidth: 64 }}>
+              <div className="flex flex-col items-center justify-end pb-1 leading-tight" style={{ height: 36 }}>
+                <span className="text-xs font-semibold" style={{ color: isToday ? "#FFFFFF" : PRIMARY, backgroundColor: isToday ? PRIMARY : "transparent", borderRadius: 999, padding: "0 8px", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{DAYS[di].short}</span>
+                <span className="text-[10.5px]" style={{ color: isToday ? PRIMARY : MUTED_LIGHT, fontWeight: isToday ? 700 : 400 }}>{fmtDM(d)}</span>
+              </div>
+              <div
+                className="daycol"
+                onMouseDown={handleMouseDown(dk, di)}
+                onDragOver={colDragOver(dk)}
+                onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDropHint((p) => (p && p.dk === dk ? null : p)); }}
+                onDrop={colDrop(dk)}
+                style={{
+                  position: "relative", height: totalHeight, cursor: editable ? "crosshair" : "default",
+                  backgroundColor: isToday ? "#FFF3F8" : isPast ? "#FCF9FA" : "#FFFCFD",
+                  backgroundImage: `repeating-linear-gradient(to bottom, #FBEAF1 0, #FBEAF1 1px, transparent 1px, transparent ${rowH}px)`,
+                  borderLeft: "1px solid #FBEAF1",
+                  borderRight: "1px solid #FDF3F7",
+                }}
+              >
+                {blocks.map((b) => {
+                  const live = resize && resize.id === b.id ? resize : b;
+                  const bs = busyStyleOf(tags, b.tag);
+                  const h = Math.max(8, (live.e - live.s) * pxPerMin);
+                  return (
                     <div
-                      onMouseDown={handleResizeStart(di, b, "start")}
-                      onClick={(e) => e.stopPropagation()}
-                      title="Kéo để chỉnh giờ bắt đầu"
-                      className="absolute left-0 right-0 top-0"
-                      style={{ height: 7, cursor: "ns-resize" }}
-                    />
-                    <span className="font-semibold">{minToHHMM(live.s)}–{minToHHMM(live.e)}</span>
-                    {bs.label && <div className="whitespace-normal break-words font-semibold">{bs.label}</div>}
-                    {b.note && <div className="whitespace-normal break-words opacity-80">{b.note}</div>}
+                      key={b.kind + b.id}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => { if (!editable) return; e.stopPropagation(); onSelectBlock && onSelectBlock(b, dk, di); }}
+                      title={[minToHHMM(b.s) + "–" + minToHHMM(b.e), bs.label, b.note, b.kind === "once" ? "(chỉ ngày này)" : "(lặp hằng tuần)"].filter(Boolean).join(" · ")}
+                      className={"absolute left-0.5 right-0.5 overflow-hidden rounded-md border px-1.5 py-0.5 text-[10.5px] leading-tight " + (editable ? "cursor-pointer hover:brightness-95" : "")}
+                      style={{
+                        top: (live.s - DAY_START_MIN) * pxPerMin, height: h,
+                        backgroundColor: bs.bg, borderColor: bs.border, borderLeftWidth: 3, color: bs.text,
+                        borderStyle: b.kind === "once" ? "dashed" : "solid",
+                        pointerEvents: editable ? "auto" : "none",
+                        opacity: editable ? 1 : 0.85,
+                      }}
+                    >
+                      {editable && <div onMouseDown={handleResizeStart(dk, di, b, "start")} onClick={(e) => e.stopPropagation()} title="Kéo để chỉnh giờ bắt đầu" className="absolute left-0 right-0 top-0" style={{ height: 7, cursor: "ns-resize" }} />}
+                      <span className="font-semibold">{minToHHMM(live.s)}–{minToHHMM(live.e)}</span>
+                      {h > 22 && bs.label && <div className="whitespace-normal break-words font-semibold">{bs.label}</div>}
+                      {h > 34 && b.note && <div className="whitespace-normal break-words opacity-80">{b.note}</div>}
+                      {editable && <div onMouseDown={handleResizeStart(dk, di, b, "end")} onClick={(e) => e.stopPropagation()} title="Kéo để chỉnh giờ kết thúc" className="absolute bottom-0 left-0 right-0" style={{ height: 7, cursor: "ns-resize" }} />}
+                    </div>
+                  );
+                })}
+                {dayTasks.map((t) => {
+                  const c = catOfTask(tags, t.category);
+                  const selected = selectedTaskId === t.id;
+                  const h = Math.max(10, taskMinutes(t) * pxPerMin);
+                  return (
                     <div
-                      onMouseDown={handleResizeStart(di, b, "end")}
-                      onClick={(e) => e.stopPropagation()}
-                      title="Kéo để chỉnh giờ kết thúc"
-                      className="absolute left-0 right-0 bottom-0"
-                      style={{ height: 7, cursor: "ns-resize" }}
-                    />
-                  </div>
-                );
-              })}
-              {draft && draft.day === di && (
-                <div
-                  className="absolute left-0.5 right-0.5 rounded-md border-2 border-dashed"
-                  style={{ top: (draft.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (draft.e - draft.s) * pxPerMin), borderColor: PRIMARY, backgroundColor: "#FDE3EE99" }}
-                />
-              )}
+                      key={"task-" + t.id}
+                      draggable={!editable}
+                      onDragStart={(e) => { draggingTaskRef.current = t; e.dataTransfer.setData("text/plain", t.id); e.dataTransfer.effectAllowed = "move"; }}
+                      onDragEnd={() => { draggingTaskRef.current = null; setDropHint(null); }}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => { e.stopPropagation(); if (!editable && onSelectTask) onSelectTask(t.id); }}
+                      title={`${t.name} · ${minToHHMM(t.scheduledStart)}–${minToHHMM(t.scheduledStart + taskMinutes(t))} · ${c.label}`}
+                      className={"absolute overflow-hidden rounded-lg border px-1.5 py-0.5 text-[10.5px] font-medium leading-tight " + (editable ? "" : "cursor-grab active:cursor-grabbing")}
+                      style={{
+                        top: (t.scheduledStart - DAY_START_MIN) * pxPerMin, height: h,
+                        left: editable ? "22%" : 2, right: 2, zIndex: 5,
+                        backgroundColor: c.bg, color: c.text,
+                        borderColor: selected ? c.text : c.border, borderWidth: selected ? 2 : 1,
+                        borderStyle: editable ? "dashed" : "solid",
+                        boxShadow: "0 1px 3px rgba(74,46,62,0.12)",
+                        pointerEvents: editable ? "none" : "auto",
+                      }}
+                    >
+                      <div className="flex items-center gap-1">
+                        {!editable && <GripVertical size={10} className="shrink-0 opacity-50" />}
+                        <span className="truncate">{t.name}</span>
+                      </div>
+                      {h > 24 && <div className="opacity-75">{minToHHMM(t.scheduledStart)}–{minToHHMM(t.scheduledStart + taskMinutes(t))}</div>}
+                    </div>
+                  );
+                })}
+                {dropHint && dropHint.dk === dk && (
+                  <div className="pointer-events-none absolute left-0.5 right-0.5 rounded-md border-2 border-dashed" style={{ top: (dropHint.s - DAY_START_MIN) * pxPerMin, height: Math.max(6, (dropHint.e - dropHint.s) * pxPerMin), borderColor: SECONDARY, backgroundColor: "#FFF1D699", zIndex: 6 }} />
+                )}
+                {draft && draft.dk === dk && (
+                  <div className="absolute left-0.5 right-0.5 rounded-md border-2 border-dashed" style={{ top: (draft.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (draft.e - draft.s) * pxPerMin), borderColor: PRIMARY, backgroundColor: "#FDE3EE99" }} />
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Lịch tháng — tổng quan cả tháng, bấm 1 ngày để mở tuần đó             */
+/* ---------------------------------------------------------------------- */
+
+function MonthCalendar({ anchor, busySlots, busyOnce, tasks, onPickDay }) {
+  const tags = useTags();
+  const month = anchor.getMonth();
+  const first = new Date(anchor.getFullYear(), month, 1);
+  const start = startOfWeek(first);
+  let cells = Array.from({ length: 42 }, (_, i) => addDays(start, i));
+  if (cells[35].getMonth() !== month) cells = cells.slice(0, 35);
+  const tk = todayKey();
+
+  return (
+    <div className="overflow-x-auto">
+      <div style={{ minWidth: 640 }}>
+        <div className="grid grid-cols-7">
+          {DAYS.map((d) => <div key={d.short} className="pb-1 text-center text-xs font-semibold" style={{ color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.full}</div>)}
+        </div>
+        <div className="grid grid-cols-7 overflow-hidden rounded-xl border" style={{ borderColor: "#FBEAF1" }}>
+          {cells.map((d) => {
+            const dk = dateKey(d);
+            const di = weekdayIdx(d);
+            const inMonth = d.getMonth() === month;
+            const isToday = dk === tk;
+            const items = [
+              ...busyForDate(busySlots, busyOnce, dk, di).map((b) => {
+                const bs = busyStyleOf(tags, b.tag);
+                return { key: "b" + b.id, s: b.s, label: b.note || bs.label || "Bận", pal: bs, task: false };
+              }),
+              ...tasks.filter((t) => t.status === "scheduled" && t.scheduledDate === dk).map((t) => {
+                const c = catOfTask(tags, t.category);
+                return { key: "t" + t.id, s: t.scheduledStart, label: t.name, pal: c, task: true };
+              }),
+            ].sort((a, b) => a.s - b.s);
+            const deadlines = tasks.filter((t) => t.status !== "scheduled" && t.deadlineDate === dk).length;
+            return (
+              <button
+                key={dk}
+                data-date={dk}
+                onClick={() => onPickDay(d)}
+                className="flex min-h-[96px] flex-col gap-0.5 border-b border-r p-1 text-left hover:bg-[#FFF6FA]"
+                style={{ borderColor: "#FBEAF1", backgroundColor: isToday ? "#FFF3F8" : "#FFFFFF", opacity: inMonth ? 1 : 0.45 }}
+              >
+                <span className="mb-0.5 flex items-center justify-between">
+                  <span className="text-xs font-semibold" style={{ color: isToday ? "#FFFFFF" : INK, backgroundColor: isToday ? PRIMARY : "transparent", borderRadius: 999, padding: "0 6px" }}>{d.getDate()}</span>
+                  {deadlines > 0 && <span className="text-[9.5px] font-semibold" style={{ color: DANGER }} title="Việc chưa xếp có hạn chót hôm nay">⏰ {deadlines}</span>}
+                </span>
+                {items.slice(0, 3).map((it) => (
+                  <span key={it.key} className="block truncate rounded px-1 text-[10px] leading-[15px]" style={{ backgroundColor: it.pal.bg, color: it.pal.text, borderLeft: `3px solid ${it.pal.border}`, fontWeight: it.task ? 700 : 500 }}>
+                    {minToHHMM(it.s)} {it.label}
+                  </span>
+                ))}
+                {items.length > 3 && <span className="text-[10px]" style={{ color: MUTED }}>+{items.length - 3} nữa</span>}
+              </button>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
@@ -811,45 +1049,48 @@ function BusyEditorGrid({ busySlots, onCreateDraft, onSelectBlock, onResizeBlock
 /*  View: Dashboard                                                       */
 /* ---------------------------------------------------------------------- */
 
-function DashboardView({ busySlots, tasks, onDropTask }) {
+function DashboardView({ busySlots, busyOnce, tasks, onDropTask }) {
   const tags = useTags();
+  const cal = useCalendarState();
   const [selectedTaskId, setSelectedTaskId] = useState(null);
   const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
 
-  const totalFreeMin = totalFreeMinutes(busySlots);
+  const weekKeys = cal.dates.map(dateKey);
   const totalBusyMin = totalBusyMinutes(busySlots);
-  const scheduled = tasks.filter((t) => t.status === "scheduled");
-  const scheduledHours = scheduled.reduce((s, t) => s + t.duration, 0);
-  const unscheduledCount = tasks.filter((t) => t.status === "unscheduled").length;
-  const utilization = totalFreeMin ? Math.round(((scheduledHours * 60) / totalFreeMin) * 100) : 0;
+  const upcoming = tasks.filter((t) => t.status === "scheduled" && t.scheduledDate >= todayKey());
+  const upcomingHours = upcoming.reduce((s, t) => s + t.duration, 0);
+  const unscheduledCount = tasks.filter((t) => t.status !== "scheduled").length;
 
-  const perDay = DAYS.map((d, di) => {
-    const free = freeMinutesForDay(busySlots, di) / 60;
-    const busy = scheduled.filter((t) => t.scheduledDay === di).reduce((s, t) => s + t.duration, 0);
-    return { ...d, free, busy };
+  const perDay = cal.dates.map((d, i) => {
+    const free = freeMinutesForDate(busySlots, busyOnce, d) / 60;
+    const busy = tasks.filter((t) => t.status === "scheduled" && t.scheduledDate === weekKeys[i]).reduce((s, t) => s + t.duration, 0);
+    return { key: weekKeys[i], short: DAYS[i].short, dm: fmtDM(d), free, busy };
   });
-  const maxHours = Math.max(1, ...perDay.map((d) => Math.max(d.free, d.busy + d.free)));
+  const weekFree = perDay.reduce((s, d) => s + d.free, 0);
+  const weekUsed = perDay.reduce((s, d) => s + d.busy, 0);
+  const utilization = weekFree ? Math.round((weekUsed / weekFree) * 100) : 0;
+  const maxHours = Math.max(1, ...perDay.map((d) => d.free));
 
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard icon={Clock3} label="Giờ bận / tuần" value={formatDuration(totalBusyMin)} accent={PRIMARY} />
-        <StatCard icon={CalendarClock} label="Đã sắp xếp" value={`${scheduledHours}h`} sub={`${scheduled.length} việc`} accent={SECONDARY} />
-        <StatCard icon={LayoutGrid} label="Tỷ lệ sử dụng" value={`${utilization}%`} accent={PURPLE} />
-        <StatCard icon={AlertTriangle} label="Chưa sắp xếp được" value={unscheduledCount} sub={unscheduledCount ? "cần điều chỉnh" : "ổn"} accent={DANGER} />
+        <StatCard icon={Clock3} label="Giờ bận cố định / tuần" value={formatDuration(totalBusyMin)} accent={PRIMARY} />
+        <StatCard icon={CalendarClock} label="Việc sắp tới" value={formatHours(upcomingHours)} sub={`${upcoming.length} việc trong 30 ngày`} accent={SECONDARY} />
+        <StatCard icon={LayoutGrid} label="Tỷ lệ dùng tuần đang xem" value={`${utilization}%`} accent={PURPLE} />
+        <StatCard icon={AlertTriangle} label="Chưa sắp xếp" value={unscheduledCount} sub={unscheduledCount ? "vào Trợ lý sắp xếp" : "ổn"} accent={DANGER} />
       </div>
 
       <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
-        <p className="mb-3 text-sm font-medium" style={{ color: INK }}>Thời gian rảnh & đã dùng theo ngày</p>
+        <p className="mb-3 text-sm font-medium" style={{ color: INK }}>Thời gian rảnh & đã dùng — tuần {fmtDM(cal.dates[0])} – {fmtDM(cal.dates[6])}</p>
         <div className="space-y-2">
           {perDay.map((d) => (
-            <div key={d.short} className="flex items-center gap-3">
-              <span className="w-9 text-xs" style={{ color: MUTED }}>{d.short}</span>
+            <div key={d.key} className="flex items-center gap-3">
+              <span className="w-16 text-xs" style={{ color: d.key === todayKey() ? PRIMARY : MUTED, fontWeight: d.key === todayKey() ? 700 : 400 }}>{d.short} {d.dm}</span>
               <div className="relative h-4 flex-1 overflow-hidden rounded-full" style={{ backgroundColor: "#FBEAF1" }}>
                 <div className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${(d.free / maxHours) * 100}%`, backgroundColor: "#FBD9E7" }} />
                 <div className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${(d.busy / maxHours) * 100}%`, backgroundColor: SECONDARY }} />
               </div>
-              <span className="w-20 text-right text-[11px]" style={{ color: MUTED_LIGHT }}>{d.busy}h / {formatDuration(d.free * 60)}</span>
+              <span className="w-24 text-right text-[11px]" style={{ color: MUTED_LIGHT }}>{formatHours(d.busy)} / {formatHours(d.free)}</span>
             </div>
           ))}
         </div>
@@ -860,51 +1101,70 @@ function DashboardView({ busySlots, tasks, onDropTask }) {
       </div>
 
       <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
-        <div className="mb-3 flex items-center justify-between">
-          <p className="text-sm font-medium" style={{ color: INK }}>Lịch tuần — kéo khối việc để đổi giờ</p>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <p className="text-sm font-medium" style={{ color: INK }}>Lịch — kéo khối việc sang giờ / ngày khác (bước 30 phút)</p>
           {selectedTask && <span className="text-xs" style={{ color: MUTED }}>Đang chọn: <b style={{ color: catOfTask(tags, selectedTask.category).text }}>{selectedTask.name}</b></span>}
         </div>
         <div className="mb-2"><TagLegend /></div>
-        <WeekGrid busySlots={busySlots} tasks={tasks} onDropTask={(day, hour) => onDropTask(selectedTaskId, day, hour)} selectedTaskId={selectedTaskId} onSelectTask={setSelectedTaskId} />
+        <CalendarPanel cal={cal}>
+          {cal.mode === "week" ? (
+            <WeekCalendar
+              mode="plan"
+              dates={cal.dates}
+              rowH={cal.rowH}
+              busySlots={busySlots}
+              busyOnce={busyOnce}
+              tasks={tasks}
+              onDropTask={onDropTask}
+              selectedTaskId={selectedTaskId}
+              onSelectTask={setSelectedTaskId}
+            />
+          ) : (
+            <MonthCalendar anchor={cal.anchor} busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onPickDay={(d) => { cal.setAnchor(d); cal.setMode("week"); }} />
+          )}
+        </CalendarPanel>
       </div>
     </div>
   );
 }
 
 /* ---------------------------------------------------------------------- */
-/*  View: Slot editor                                                     */
+/*  View: Slot editor — khung giờ bận (lặp hằng tuần hoặc chỉ 1 ngày)     */
+/*  Việc cần làm đã sắp xếp cũng hiện lên đây (viền nét đứt, chỉ xem).     */
 /* ---------------------------------------------------------------------- */
 
-function SlotEditorView({ busySlots, setBusySlots, setTags, notify }) {
-  const [editing, setEditing] = useState(null); // { day, id, s, e, note, tag }
-  // Khối mới kéo ra sẽ tự gắn tag dùng gần nhất, đỡ phải chọn lại nhiều lần
+function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks, setTags, notify }) {
+  const cal = useCalendarState();
+  const [editing, setEditing] = useState(null); // { kind, mk, dk, di, id, s, e, note, tag, isDraft }
+  // Khối mới kéo ra sẽ theo tag và kiểu lặp dùng gần nhất, đỡ phải chọn lại
   const lastTagRef = useRef("");
-  const totalFreeMin = totalFreeMinutes(busySlots);
+  const lastRepeatRef = useRef(true);
 
-  // Bọc useCallback để giữ nguyên tham chiếu hàm giữa các lần render — nếu
-  // không, useEffect trong BusyEditorGrid sẽ nghĩ dependency đổi liên tục
-  // và gỡ/gắn lại listener mỗi lần render, dễ gây lỗi React #185.
-  const handleCreateDraft = useCallback((day, s, e) => {
-    // Cố định khối ngay khi thả chuột, để khung giờ không "biến mất"
-    // sau khi kéo — form bên dưới chỉ dùng để ghi chú / chỉnh thêm.
+  const setterOf = useCallback((kind) => (kind === "once" ? setBusyOnce : setBusySlots), [setBusySlots, setBusyOnce]);
+
+  const weekFreeMin = cal.dates.reduce((s, d) => s + freeMinutesForDate(busySlots, busyOnce, d), 0);
+
+  // useCallback để giữ nguyên tham chiếu hàm — tránh lỗi React #185
+  const handleCreateDraft = useCallback((dk, di, s, e) => {
     const [cs, ce] = clampRange(s, e);
     if (ce <= cs) return;
-    const newId = uid();
+    const id = uid();
     const tag = lastTagRef.current || "";
-    setBusySlots((prev) => ({ ...prev, [day]: [...(prev[day] || []), { id: newId, s: cs, e: ce, note: "", tag }] }));
-    setEditing({ day, id: newId, s: cs, e: ce, note: "", tag, isDraft: true });
-  }, [setBusySlots]);
+    const kind = lastRepeatRef.current ? "weekly" : "once";
+    const mk = kind === "weekly" ? di : dk;
+    setterOf(kind)((prev) => ({ ...prev, [mk]: [...(prev[mk] || []), { id, s: cs, e: ce, note: "", tag }] }));
+    setEditing({ kind, mk, dk, di, id, s: cs, e: ce, note: "", tag, isDraft: true });
+  }, [setterOf]);
 
-  const handleSelectBlock = useCallback((day, block) => {
-    setEditing({ day, id: block.id, s: block.s, e: block.e, note: block.note || "", tag: block.tag || "" });
+  const handleSelectBlock = useCallback((b, dk, di) => {
+    setEditing({ kind: b.kind, mk: b.kind === "weekly" ? di : dk, dk, di, id: b.id, s: b.s, e: b.e, note: b.note || "", tag: b.tag || "" });
   }, []);
 
-  const handleResizeBlock = useCallback((day, id, patch) => {
-    // Kéo mép để chỉnh giờ trực tiếp trên lịch (VD kéo lố vài phút thì
-    // kéo lại cho khớp) — cập nhật cả form đang mở nếu đúng khối đó.
-    setBusySlots((prev) => updateBusyBlock(prev, day, id, patch));
-    setEditing((prev) => (prev && prev.id === id ? { ...prev, ...patch } : prev));
-  }, [setBusySlots]);
+  const handleResizeBlock = useCallback((b, dk, di, patch) => {
+    const mk = b.kind === "weekly" ? di : dk;
+    setterOf(b.kind)((prev) => updateBusyBlock(prev, mk, b.id, patch));
+    setEditing((prev) => (prev && prev.id === b.id ? { ...prev, ...patch } : prev));
+  }, [setterOf]);
 
   return (
     <div className="space-y-4">
@@ -912,12 +1172,13 @@ function SlotEditorView({ busySlots, setBusySlots, setTags, notify }) {
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
             <p className="text-sm font-medium" style={{ color: INK }}>Đánh dấu khung giờ bận</p>
-            <p className="text-xs" style={{ color: MUTED }}>Kéo chuột trên lịch để chọn chính xác tới 5 phút · kéo mép trên/dưới của khối đã có để chỉnh lại · khung giờ chưa đánh dấu mặc định là rảnh · {formatDuration(totalFreeMin)} rảnh / tuần</p>
+            <p className="text-xs" style={{ color: MUTED }}>Kéo chuột trên lịch để chọn (chính xác tới 5 phút) · kéo mép trên/dưới để chỉnh · việc đã sắp xếp hiện viền nét đứt · tuần đang xem còn {formatDuration(weekFreeMin)} rảnh</p>
           </div>
           <button
             onClick={() => {
-              if (!window.confirm("Xoá TOÀN BỘ khung giờ bận đã đánh dấu? Hành động này không thể hoàn tác.")) return;
+              if (!window.confirm("Xoá TOÀN BỘ khung giờ bận đã đánh dấu (cả lặp hằng tuần lẫn từng ngày)? Hành động này không thể hoàn tác.")) return;
               setBusySlots({});
+              setBusyOnce({});
               setEditing(null);
             }}
             className="flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF1F1]"
@@ -926,37 +1187,66 @@ function SlotEditorView({ busySlots, setBusySlots, setTags, notify }) {
             <RotateCcw size={13} /> Xoá tất cả
           </button>
         </div>
-        <div className="mb-2"><TagLegend /></div>
-        <BusyEditorGrid
-          busySlots={busySlots}
-          onCreateDraft={handleCreateDraft}
-          onSelectBlock={handleSelectBlock}
-          onResizeBlock={handleResizeBlock}
-        />
+        <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1">
+          <TagLegend />
+          <span className="flex items-center gap-3 text-[11px]" style={{ color: MUTED }}>
+            <span className="flex items-center gap-1"><span className="inline-block h-2.5 w-4 rounded-sm border" style={{ borderColor: MUTED }} />Lặp hằng tuần</span>
+            <span className="flex items-center gap-1"><span className="inline-block h-2.5 w-4 rounded-sm border border-dashed" style={{ borderColor: MUTED }} />Chỉ 1 ngày / việc đã xếp</span>
+          </span>
+        </div>
+        <CalendarPanel cal={cal}>
+          {cal.mode === "week" ? (
+            <WeekCalendar
+              mode="edit"
+              dates={cal.dates}
+              rowH={cal.rowH}
+              busySlots={busySlots}
+              busyOnce={busyOnce}
+              tasks={tasks}
+              onCreateDraft={handleCreateDraft}
+              onSelectBlock={handleSelectBlock}
+              onResizeBlock={handleResizeBlock}
+            />
+          ) : (
+            <MonthCalendar anchor={cal.anchor} busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onPickDay={(d) => { cal.setAnchor(d); cal.setMode("week"); }} />
+          )}
+        </CalendarPanel>
       </div>
 
-      <BusyBlockForm editing={editing} setEditing={setEditing} setBusySlots={setBusySlots} notify={notify} lastTagRef={lastTagRef} />
-      <TagManager busySlots={busySlots} setBusySlots={setBusySlots} setTags={setTags} notify={notify} />
+      <BusyBlockForm editing={editing} setEditing={setEditing} setterOf={setterOf} notify={notify} lastTagRef={lastTagRef} lastRepeatRef={lastRepeatRef} />
+      <TagManager busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} setTags={setTags} notify={notify} />
     </div>
   );
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Form thêm/sửa 1 khối "khung giờ bận" — có ghi chú đang bận việc gì     */
+/*  Form sửa 1 khối "khung giờ bận" — giờ, ghi chú, tag, lặp hay 1 lần     */
 /* ---------------------------------------------------------------------- */
 
-function BusyBlockForm({ editing, setEditing, setBusySlots, notify, lastTagRef }) {
+function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, lastRepeatRef }) {
   const tags = useTags();
   if (!editing) {
     return (
       <div className="rounded-2xl border border-dashed p-4 text-center text-xs" style={{ borderColor: BORDER, color: MUTED }}>
-        Kéo chuột trên lịch phía trên để đánh dấu khung giờ bận (chính xác tới 5 phút). Muốn chỉnh lại 1 khung đã có: kéo mép trên/dưới của khối đó để đổi giờ trực tiếp, hoặc bấm vào giữa khối để sửa / xoá.
+        Kéo chuột trên lịch phía trên để đánh dấu khung giờ bận. Muốn chỉnh 1 khung đã có: kéo mép trên/dưới để đổi giờ, hoặc bấm vào giữa khối để sửa ghi chú, gắn tag, chọn lặp hằng tuần hay chỉ 1 ngày, hoặc xoá.
       </div>
     );
   }
 
-  const { day, id, s, e, note } = editing;
+  const { kind, mk, dk, di, id } = editing;
   const setField = (patch) => setEditing((prev) => ({ ...prev, ...patch }));
+  const setMap = setterOf(kind);
+  const liveUpdate = (patch) => { setField(patch); setMap((prev) => updateBusyBlock(prev, mk, id, patch)); };
+
+  const setRepeat = (repeat) => {
+    const toKind = repeat ? "weekly" : "once";
+    if (toKind === kind) return;
+    const toMk = repeat ? di : dk;
+    const block = { id, s: editing.s, e: editing.e, note: editing.note, tag: editing.tag || "" };
+    setMap((prev) => removeBusyBlock(prev, mk, id));
+    setterOf(toKind)((prev) => ({ ...prev, [toMk]: [...(prev[toMk] || []), block] }));
+    setEditing((prev) => ({ ...prev, kind: toKind, mk: toMk }));
+  };
 
   const save = () => {
     if (editing.e <= editing.s) { notify("Giờ kết thúc phải sau giờ bắt đầu.", "error"); return; }
@@ -964,26 +1254,24 @@ function BusyBlockForm({ editing, setEditing, setBusySlots, notify, lastTagRef }
       notify(`Chỉ có thể chọn trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`, "error");
       return;
     }
-    if (id) {
-      setBusySlots((prev) => updateBusyBlock(prev, day, id, { s: editing.s, e: editing.e, note: editing.note.trim(), tag: editing.tag || "" }));
-      notify("Đã cập nhật khung giờ bận.", "success");
-    } else {
-      setBusySlots((prev) => addBusyBlock(prev, day, editing.s, editing.e, editing.note, editing.tag));
-      notify(`Đã đánh dấu bận ${minToHHMM(editing.s)} – ${minToHHMM(editing.e)}.`, "success");
-    }
+    setMap((prev) => updateBusyBlock(prev, mk, id, { s: editing.s, e: editing.e, note: editing.note.trim(), tag: editing.tag || "" }));
+    notify(kind === "weekly" ? `Đã lưu — lặp lại mỗi ${DAYS[di].full}.` : `Đã lưu — chỉ ngày ${fmtDateLabel(dk)}.`, "success");
     if (lastTagRef) lastTagRef.current = editing.tag || "";
+    if (lastRepeatRef) lastRepeatRef.current = kind === "weekly";
     setEditing(null);
   };
 
   const remove = () => {
-    setBusySlots((prev) => removeBusyBlock(prev, day, id));
+    setMap((prev) => removeBusyBlock(prev, mk, id));
     notify("Đã xoá khung giờ bận.", "success");
     setEditing(null);
   };
 
+  const chip = (active, pal) => ({ borderColor: active ? pal.border : BORDER, borderWidth: active ? 2 : 1, backgroundColor: active ? pal.bg : "#FFFFFF", color: active ? pal.text : INK });
+
   return (
     <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
-      <p className="mb-3 text-sm font-medium" style={{ color: INK }}>{editing.isDraft ? "Khung giờ bận mới" : "Sửa khung giờ bận"} — {DAYS[day].full}</p>
+      <p className="mb-3 text-sm font-medium" style={{ color: INK }}>{editing.isDraft ? "Khung giờ bận mới" : "Sửa khung giờ bận"} — {fmtDateLabel(dk)}</p>
       <div className="flex flex-wrap items-end gap-2">
         <div>
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Bắt đầu</label>
@@ -1000,16 +1288,13 @@ function BusyBlockForm({ editing, setEditing, setBusySlots, notify, lastTagRef }
         <button onClick={save} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-semibold text-white" style={{ backgroundColor: SECONDARY, color: "#5A4405", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
           <CheckCircle2 size={14} /> Lưu
         </button>
-        {id && (
-          <button onClick={remove} className="flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: DANGER }}>
-            <Trash2 size={13} /> Xoá
-          </button>
-        )}
+        <button onClick={remove} className="flex items-center gap-1.5 rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: DANGER }}>
+          <Trash2 size={13} /> Xoá
+        </button>
         <button
           onClick={() => {
-            // Nếu đang huỷ 1 khối vừa kéo (chưa từng lưu ghi chú), xoá luôn
-            // khối đó thay vì để lại 1 khung giờ bận trống không mong muốn.
-            if (editing.isDraft) setBusySlots((prev) => removeBusyBlock(prev, day, id));
+            // Huỷ 1 khối vừa kéo (chưa lưu) thì xoá luôn khối đó
+            if (editing.isDraft) setMap((prev) => removeBusyBlock(prev, mk, id));
             setEditing(null);
           }}
           className="rounded-full border px-3 py-2 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}
@@ -1017,30 +1302,24 @@ function BusyBlockForm({ editing, setEditing, setBusySlots, notify, lastTagRef }
           Huỷ
         </button>
       </div>
+
+      <div className="mt-3">
+        <label className="mb-1.5 block text-xs" style={{ color: MUTED }}>Lặp lại</label>
+        <div className="flex flex-wrap gap-1.5">
+          <button onClick={() => setRepeat(true)} className="rounded-full border px-3 py-1 text-xs font-medium" style={chip(kind === "weekly", tagPalette(PRIMARY))}>Lặp lại mỗi {DAYS[di].full}</button>
+          <button onClick={() => setRepeat(false)} className="rounded-full border px-3 py-1 text-xs font-medium" style={chip(kind === "once", tagPalette(PRIMARY))}>Chỉ ngày {fmtDM(parseKey(dk))}</button>
+        </div>
+      </div>
+
       <div className="mt-3">
         <label className="mb-1.5 flex items-center gap-1 text-xs" style={{ color: MUTED }}><TagIcon size={12} /> Phân loại (tag)</label>
         <div className="flex flex-wrap gap-1.5">
-          <button
-            onClick={() => { setField({ tag: "" }); setBusySlots((prev) => updateBusyBlock(prev, day, id, { tag: "" })); }}
-            className="rounded-full border px-3 py-1 text-xs font-medium"
-            style={{ borderColor: !editing.tag ? DANGER : BORDER, backgroundColor: !editing.tag ? "#FBD9E7" : "#FFFFFF", color: "#7A3348", borderWidth: !editing.tag ? 2 : 1 }}
-          >
-            Không gắn tag
-          </button>
-          {tags.map((t) => {
-            const pal = tagPalette(t.color);
-            const active = editing.tag === t.id;
-            return (
-              <button
-                key={t.id}
-                onClick={() => { setField({ tag: t.id }); setBusySlots((prev) => updateBusyBlock(prev, day, id, { tag: t.id })); }}
-                className="flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium"
-                style={{ borderColor: active ? pal.border : BORDER, borderWidth: active ? 2 : 1, backgroundColor: active ? pal.bg : "#FFFFFF", color: active ? pal.text : INK }}
-              >
-                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: t.color }} />{t.label}
-              </button>
-            );
-          })}
+          <button onClick={() => liveUpdate({ tag: "" })} className="rounded-full border px-3 py-1 text-xs font-medium" style={chip(!editing.tag, UNTAGGED_BUSY)}>Không gắn tag</button>
+          {tags.map((t) => (
+            <button key={t.id} onClick={() => liveUpdate({ tag: t.id })} className="flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium" style={chip(editing.tag === t.id, tagPalette(t.color))}>
+              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: t.color }} />{t.label}
+            </button>
+          ))}
         </div>
       </div>
     </div>
@@ -1051,13 +1330,14 @@ function BusyBlockForm({ editing, setEditing, setBusySlots, notify, lastTagRef }
 /*  Quản lý tag: chọn màu, đổi tên, thêm / xoá tag tự tạo                  */
 /* ---------------------------------------------------------------------- */
 
-function TagManager({ busySlots, setBusySlots, setTags, notify }) {
+function TagManager({ busySlots, setBusySlots, busyOnce, setBusyOnce, setTags, notify }) {
   const tags = useTags();
   const [newLabel, setNewLabel] = useState("");
   const [newColor, setNewColor] = useState(TAG_SWATCHES[5]);
   const [openPicker, setOpenPicker] = useState(null); // id tag đang mở bảng màu
 
-  const countFor = (tagId) => Object.values(busySlots || {}).reduce((n, list) => n + (list || []).filter((b) => b.tag === tagId).length, 0);
+  const countIn = (map, tagId) => Object.values(map || {}).reduce((n, list) => n + (list || []).filter((b) => b.tag === tagId).length, 0);
+  const countFor = (tagId) => countIn(busySlots, tagId) + countIn(busyOnce, tagId);
   const patchTag = (id, patch) => setTags((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
 
   const addTag = () => {
@@ -1074,11 +1354,13 @@ function TagManager({ busySlots, setBusySlots, setTags, notify }) {
     if (!window.confirm(`Xoá tag "${t.label}"?${n ? `\n${n} khung giờ bận đang gắn tag này sẽ trở về "Không gắn tag".` : ""}`)) return;
     setTags((prev) => prev.filter((x) => x.id !== t.id));
     if (n) {
-      setBusySlots((prev) => {
+      const clear = (prev) => {
         const out = {};
         Object.keys(prev).forEach((d) => { out[d] = (prev[d] || []).map((b) => (b.tag === t.id ? { ...b, tag: "" } : b)); });
         return out;
-      });
+      };
+      setBusySlots(clear);
+      setBusyOnce(clear);
     }
   };
 
@@ -1148,34 +1430,50 @@ function TagLegend() {
 }
 
 /* ---------------------------------------------------------------------- */
-/*  View: Assistant                                                       */
+/*  View: Assistant — thêm việc (hạn chót chọn trên lịch, trong 1 tháng)   */
 /* ---------------------------------------------------------------------- */
 
-function AssistantView({ tasks, setTasks, busySlots, notify }) {
+function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
   const tags = useTags();
-  const [form, setForm] = useState({ name: "", category: "dihoc", duration: 1, deadlineDay: 4, deadlineHour: 18 });
+  const tk = todayKey();
+  const maxKey = dateKey(addDays(new Date(), PLAN_WINDOW_DAYS));
+  const [form, setForm] = useState(() => ({ name: "", category: "dayhoc", duration: 1.5, deadlineDate: dateKey(addDays(new Date(), 7)), deadlineMin: 18 * 60 }));
+
+  const deadlineOptions = [];
+  for (let m = DAY_START_MIN + PLAN_STEP_MIN; m <= DAY_END_MIN; m += PLAN_STEP_MIN) deadlineOptions.push(m);
+
+  const daysLeft = Math.round((parseKey(form.deadlineDate) - parseKey(tk)) / 86400000);
 
   const addTask = () => {
     if (!form.name.trim()) { notify("Nhập tên việc cần làm trước đã nhé.", "error"); return; }
-    if (form.deadlineHour - form.duration < HOUR_START) { notify("Deadline quá sớm so với thời lượng, hãy chọn giờ muộn hơn.", "error"); return; }
-    setTasks((prev) => [...prev, { id: uid(), name: form.name.trim(), category: form.category, duration: Number(form.duration), deadlineDay: Number(form.deadlineDay), deadlineHour: Number(form.deadlineHour), status: "pending", scheduledDay: null, scheduledStart: null }]);
+    if (!form.deadlineDate || form.deadlineDate < tk || form.deadlineDate > maxKey) { notify(`Hạn chót phải trong khoảng hôm nay đến ${fmtDM(parseKey(maxKey))}.`, "error"); return; }
+    const dm = Math.round(Number(form.duration) * 60);
+    if (form.deadlineMin - dm < DAY_START_MIN) { notify("Hạn chót quá sớm so với thời lượng, hãy chọn giờ muộn hơn.", "error"); return; }
+    if (form.deadlineDate === tk && form.deadlineMin <= nowMinutes()) { notify("Giờ hạn chót hôm nay đã qua rồi.", "error"); return; }
+    setTasks((prev) => [...prev, {
+      id: uid(), name: form.name.trim(), category: form.category, duration: Number(form.duration),
+      deadlineDate: form.deadlineDate, deadlineMin: Number(form.deadlineMin),
+      status: "pending", scheduledDate: null, scheduledStart: null, v: 2,
+    }]);
     setForm((f) => ({ ...f, name: "" }));
   };
   const removeTask = (id) => setTasks((prev) => prev.filter((t) => t.id !== id));
-  const unschedule = (id) => setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "pending", scheduledDay: null, scheduledStart: null } : t)));
+  const unschedule = (id) => setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "pending", scheduledDate: null, scheduledStart: null } : t)));
 
   const runAuto = () => {
-    const results = autoSchedule(tasks, busySlots);
+    const results = autoSchedule(tasks, busySlots, busyOnce);
     const ids = Object.keys(results);
     if (!ids.length) { notify("Không có việc nào đang chờ sắp xếp.", "error"); return; }
     setTasks((prev) => prev.map((t) => (results[t.id] ? { ...t, ...results[t.id] } : t)));
     const okCount = Object.values(results).filter((r) => r.status === "scheduled").length;
     const failCount = ids.length - okCount;
-    notify(failCount ? `Đã sắp xếp ${okCount} việc, còn ${failCount} việc chưa tìm được chỗ trống phù hợp.` : `Đã sắp xếp thành công ${okCount} việc vào thời gian rảnh.`, failCount ? "error" : "success");
+    notify(failCount ? `Đã sắp xếp ${okCount} việc, còn ${failCount} việc chưa tìm được chỗ trống trước hạn chót.` : `Đã sắp xếp ${okCount} việc — lịch bận đã tự cập nhật.`, failCount ? "error" : "success");
   };
 
-  const pending = tasks.filter((t) => t.status !== "scheduled");
-  const scheduled = tasks.filter((t) => t.status === "scheduled");
+  const pending = tasks.filter((t) => t.status !== "scheduled").sort((a, b) => (a.deadlineDate + String(a.deadlineMin).padStart(4, "0")).localeCompare(b.deadlineDate + String(b.deadlineMin).padStart(4, "0")));
+  const scheduled = tasks.filter((t) => t.status === "scheduled").sort((a, b) => (a.scheduledDate + pad2(Math.floor(a.scheduledStart / 60)) + pad2(a.scheduledStart % 60)).localeCompare(b.scheduledDate + pad2(Math.floor(b.scheduledStart / 60)) + pad2(b.scheduledStart % 60)));
+  const inputCls = "w-full rounded-xl border px-3 py-2 text-sm outline-none";
+  const inputStyle = { borderColor: BORDER, color: INK, backgroundColor: "#FFFFFF" };
 
   return (
     <div className="grid gap-6 lg:grid-cols-[340px_1fr]">
@@ -1183,41 +1481,53 @@ function AssistantView({ tasks, setTasks, busySlots, notify }) {
         <p className="flex items-center gap-2 text-sm font-medium" style={{ color: INK }}><PenSquare size={15} /> Thêm việc cần làm</p>
         <div>
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Tên lớp học / việc cần làm</label>
-          <input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") addTask(); }} placeholder="VD: Dạy lớp HSK3, Học tiếng Anh..." className="w-full rounded-xl border px-3 py-2 text-sm outline-none focus:ring-2" style={{ borderColor: BORDER, color: INK }} />
+          <input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") addTask(); }} placeholder="VD: Dạy lớp HSK3, Học tiếng Anh..." className={inputCls + " focus:ring-2"} style={inputStyle} />
         </div>
         <div>
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Phân loại</label>
-          <select value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
+          <select value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))} className={inputCls} style={inputStyle}>
             {tags.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
           </select>
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Thời lượng (giờ)</label>
-            <select value={form.duration} onChange={(e) => setForm((f) => ({ ...f, duration: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
-              {[1, 2, 3, 4, 5, 6].map((n) => <option key={n} value={n}>{n}h</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Hạn chót — ngày</label>
-            <select value={form.deadlineDay} onChange={(e) => setForm((f) => ({ ...f, deadlineDay: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
-              {DAYS.map((d, i) => <option key={d.short} value={i}>{d.full}</option>)}
-            </select>
-          </div>
-        </div>
         <div>
-          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Hạn chót — trước giờ</label>
-          <select value={form.deadlineHour} onChange={(e) => setForm((f) => ({ ...f, deadlineHour: e.target.value }))} className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }}>
-            {Array.from({ length: 18 }, (_, i) => HOUR_START + 1 + i).map((h) => <option key={h} value={h}>{h}:00</option>)}
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Thời lượng</label>
+          <select value={form.duration} onChange={(e) => setForm((f) => ({ ...f, duration: Number(e.target.value) }))} className={inputCls} style={inputStyle}>
+            {DURATION_OPTIONS.map((n) => <option key={n} value={n}>{formatHours(n)}</option>)}
           </select>
         </div>
+        <div className="grid grid-cols-[1fr_110px] gap-3">
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Hạn chót — ngày</label>
+            <input
+              type="date"
+              min={tk}
+              max={maxKey}
+              value={form.deadlineDate}
+              onClick={(e) => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (err) {} }}
+              onChange={(e) => setForm((f) => ({ ...f, deadlineDate: e.target.value }))}
+              className={inputCls + " cursor-pointer"}
+              style={inputStyle}
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs" style={{ color: MUTED }}>Trước giờ</label>
+            <select value={form.deadlineMin} onChange={(e) => setForm((f) => ({ ...f, deadlineMin: Number(e.target.value) }))} className={inputCls} style={inputStyle}>
+              {deadlineOptions.map((m) => <option key={m} value={m}>{minToHHMM(m)}</option>)}
+            </select>
+          </div>
+        </div>
+        {form.deadlineDate && (
+          <p className="text-[11px]" style={{ color: MUTED }}>
+            Hạn: <b style={{ color: INK }}>{fmtDateLabel(form.deadlineDate)}</b> lúc {minToHHMM(form.deadlineMin)} · {daysLeft <= 0 ? "hôm nay" : `còn ${daysLeft} ngày`} · chọn được tới {fmtDM(parseKey(maxKey))}
+          </p>
+        )}
         <button onClick={addTask} className="flex w-full items-center justify-center gap-1.5 rounded-full py-2 text-sm font-semibold text-white" style={{ backgroundColor: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
           <Plus size={15} /> Thêm vào danh sách
         </button>
       </div>
 
       <div className="space-y-5">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="flex items-center gap-2 text-sm font-medium" style={{ color: INK }}><ListChecks size={15} /> Danh sách chờ sắp xếp ({pending.length})</p>
           <button onClick={runAuto} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-semibold text-white" style={{ backgroundColor: SECONDARY, color: "#5A4405", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
             <Sparkles size={15} /> Sắp xếp thông minh
@@ -1233,15 +1543,16 @@ function AssistantView({ tasks, setTasks, busySlots, notify }) {
           <div className="space-y-2">
             {pending.map((t) => {
               const c = catOfTask(tags, t.category);
+              const overdue = t.deadlineDate < tk || (t.deadlineDate === tk && t.deadlineMin <= nowMinutes());
               return (
-                <div key={t.id} className="flex items-center justify-between rounded-xl border px-3 py-2.5" style={{ borderColor: t.status === "unscheduled" ? "#F3C1CE" : BORDER, backgroundColor: t.status === "unscheduled" ? "#FEF2F5" : CARD }}>
+                <div key={t.id} className="flex items-center justify-between rounded-xl border px-3 py-2.5" style={{ borderColor: t.status === "unscheduled" || overdue ? "#F3C1CE" : BORDER, backgroundColor: t.status === "unscheduled" || overdue ? "#FEF2F5" : CARD }}>
                   <div className="flex items-center gap-2.5">
-                    <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: c.border }} />
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: c.border }} />
                     <div>
                       <p className="text-sm font-medium" style={{ color: INK }}>{t.name}</p>
                       <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>
-                        {c.label} · {t.duration}h · hạn {DAYS[t.deadlineDay].full} {t.deadlineHour}:00
-                        {t.status === "unscheduled" && <span style={{ color: DANGER }}> · chưa tìm được chỗ trống</span>}
+                        {c.label} · {formatHours(t.duration)} · hạn {fmtDateLabel(t.deadlineDate)} {minToHHMM(t.deadlineMin)}
+                        {overdue ? <span style={{ color: DANGER }}> · đã quá hạn</span> : t.status === "unscheduled" && <span style={{ color: DANGER }}> · chưa tìm được chỗ trống</span>}
                       </p>
                     </div>
                   </div>
@@ -1252,20 +1563,21 @@ function AssistantView({ tasks, setTasks, busySlots, notify }) {
           </div>
         )}
 
-        <p className="pt-2 text-sm font-medium" style={{ color: INK }}>Đã sắp xếp ({scheduled.length})</p>
+        <p className="pt-2 text-sm font-medium" style={{ color: INK }}>Đã sắp xếp ({scheduled.length}) <span className="text-[11px] font-normal" style={{ color: MUTED_LIGHT }}>· hiện trên lịch Tổng quan & Khung giờ bận, kéo thả ở Tổng quan để đổi giờ</span></p>
         {scheduled.length === 0 ? (
           <p className="text-xs" style={{ color: MUTED_LIGHT }}>Chưa có việc nào được sắp lịch.</p>
         ) : (
           <div className="space-y-2">
             {scheduled.map((t) => {
               const c = catOfTask(tags, t.category);
+              const past = t.scheduledDate < tk;
               return (
-                <div key={t.id} className="flex items-center justify-between rounded-xl border px-3 py-2.5" style={{ borderColor: BORDER }}>
+                <div key={t.id} className="flex items-center justify-between rounded-xl border px-3 py-2.5" style={{ borderColor: BORDER, opacity: past ? 0.6 : 1 }}>
                   <div className="flex items-center gap-2.5">
-                    <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: c.border }} />
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: c.border }} />
                     <div>
                       <p className="text-sm font-medium" style={{ color: INK }}>{t.name}</p>
-                      <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>{DAYS[t.scheduledDay].full} · {t.scheduledStart}:00 – {t.scheduledStart + t.duration}:00</p>
+                      <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>{fmtDateLabel(t.scheduledDate)} · {minToHHMM(t.scheduledStart)} – {minToHHMM(t.scheduledStart + taskMinutes(t))} · {c.label}</p>
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
@@ -1931,6 +2243,8 @@ function App() {
   const [busySlots, setBusySlots] = useState({});
   const [tasks, setTasks] = useState([]);
   const [tags, setTags] = useState(DEFAULT_TAGS);
+  // Khung giờ bận chỉ diễn ra 1 lần: { "YYYY-MM-DD": [{ id, s, e, note, tag }] }
+  const [busyOnce, setBusyOnce] = useState({});
   // Trung tâm: centerIds = các trung tâm mình tham gia với vai trò giáo viên;
   // ownedCenterId = trung tâm mình làm chủ (nếu có).
   const [centerIds, setCenterIds] = useState([]);
@@ -1966,12 +2280,17 @@ function App() {
         const data = snap.data() || {};
         setCenterIds(Array.isArray(data.centerIds) ? data.centerIds : []);
         setTags(normalizeTags(data.tags));
+        setBusyOnce(normalizeLoadedBusySlots(data.busyOnce));
+        // Việc kiểu cũ (hạn theo "thứ") → chuyển sang ngày thật, lưu lại ngay
+        const rawTasks = Array.isArray(data.tasks) ? data.tasks : [];
+        const loadedTasks = rawTasks.map(migrateTask).filter(Boolean);
+        if (rawTasks.some((t) => t && t.v !== 2)) ref.set({ tasks: loadedTasks }, { merge: true }).catch(() => {});
         setOwnedCenterId(data.ownedCenterId || null);
         if (data.busySlots) {
           const loadedBusy = normalizeLoadedBusySlots(data.busySlots);
           skipNextSave.current = true;
           setBusySlots(loadedBusy);
-          setTasks(data.tasks || []);
+          setTasks(loadedTasks);
         } else {
           // Dữ liệu cũ chỉ có "freeSlots" (khung giờ rảnh) — chuyển sang mô
           // hình "khung giờ bận" mới bằng phần bù, rồi lưu lại luôn.
@@ -1979,13 +2298,13 @@ function App() {
           const migratedBusy = migrateFreeToBusySlots(oldFree);
           skipNextSave.current = true;
           setBusySlots(migratedBusy);
-          setTasks(data.tasks || []);
+          setTasks(loadedTasks);
           ref.set({ busySlots: migratedBusy }, { merge: true }).catch(() => {});
         }
       } else {
         const rawInitFree = loadLS(LS_FREE, null);
         const initBusy = rawInitFree ? migrateFreeToBusySlots(normalizeLoadedFreeIntervals(rawInitFree)) : {};
-        const initTasks = loadLS(LS_TASKS, null) || [];
+        const initTasks = (loadLS(LS_TASKS, null) || []).map(migrateTask).filter(Boolean);
         skipNextSave.current = true;
         setBusySlots(initBusy);
         setTasks(initTasks);
@@ -2019,7 +2338,7 @@ function App() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       db.collection("users").doc(user.uid).set({
-        busySlots, tasks,
+        busySlots, busyOnce, tasks,
         tags: tags.map(({ id, label, color }) => ({ id, label: label.trim() || "Tag", color })),
         email: user.email || null,
         updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
@@ -2029,7 +2348,7 @@ function App() {
       }).catch(() => notify("Lưu dữ liệu thất bại, kiểm tra kết nối mạng.", "error"));
     }, 600);
     return () => clearTimeout(saveTimer.current);
-  }, [busySlots, tasks, tags, user, dataLoading]);
+  }, [busySlots, busyOnce, tasks, tags, user, dataLoading]);
 
   /* Đồng bộ khung giờ bận cá nhân vào từng trung tâm mình đang tham gia (với
      vai trò giáo viên), để chủ trung tâm xem được lịch rảnh khi xếp lớp.
@@ -2055,25 +2374,25 @@ function App() {
     setBusySlots({});
     setTasks([]);
     setTags(DEFAULT_TAGS);
+    setBusyOnce({});
     setDataLoading(true);
   };
 
-  const handleDropTask = (taskId, day, hour) => {
+  const handleDropTask = (taskId, dk, startMin) => {
     if (!taskId) return;
     const task = tasks.find((t) => t.id === taskId);
     if (!task) return;
-    const occupied = buildOccupied(tasks, task.id);
-    if (hour + task.duration - 1 > HOUR_END || !canPlace(busySlots, occupied, day, hour, task.duration, task.id)) {
-      notify("Không thể đặt vào đây — trùng lịch hoặc đã bị đánh dấu bận.", "error");
-      return;
-    }
-    setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: "scheduled", scheduledDay: day, scheduledStart: hour } : t)));
+    const err = placementError(busySlots, busyOnce, tasks, task, dk, startMin);
+    if (err) { notify("Không thể đặt vào đây — " + err, "error"); return; }
+    setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, status: "scheduled", scheduledDate: dk, scheduledStart: startMin } : t)));
+    notify(`Đã chuyển "${task.name}" sang ${fmtDateLabel(dk)} ${minToHHMM(startMin)}.`, "success");
   };
 
   const resetAllData = () => {
     const emailHint = user?.email ? ` của tài khoản ${user.email}` : "";
     if (!window.confirm(`XOÁ VĨNH VIỄN toàn bộ dữ liệu đã lưu${emailHint} (khung giờ bận + việc cần làm)?\n\nHành động này KHÔNG THỂ hoàn tác. Bấm OK chỉ khi bạn chắc chắn muốn xoá sạch.`)) return;
     setBusySlots({});
+    setBusyOnce({});
     setTasks([]);
     notify("Đã xoá toàn bộ dữ liệu.", "success");
   };
@@ -2131,8 +2450,8 @@ function App() {
 
       <TagsContext.Provider value={tags}>
       <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
-        {view === "dashboard" && <DashboardView busySlots={busySlots} tasks={tasks} onDropTask={handleDropTask} />}
-        {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} setTags={setTags} notify={notify} />}
+        {view === "dashboard" && <DashboardView busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onDropTask={handleDropTask} />}
+        {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} tasks={tasks} setTags={setTags} notify={notify} />}
         {view === "center" && (
           <CenterView
             user={user}
@@ -2143,7 +2462,7 @@ function App() {
             notify={notify}
           />
         )}
-        {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} busySlots={busySlots} notify={notify} />}
+        {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} busySlots={busySlots} busyOnce={busyOnce} notify={notify} />}
       </main>
       </TagsContext.Provider>
 
