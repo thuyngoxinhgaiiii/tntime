@@ -8,23 +8,24 @@
 <!-- Tailwind CSS (CDN, không cần build) -->
 <script src="https://cdn.tailwindcss.com"></script>
 
-<!-- React + ReactDOM (UMD, chạy thẳng trên trình duyệt) -->
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<!-- React + ReactDOM (UMD, chạy thẳng trên trình duyệt).
+     integrity = mã kiểm tra: nếu thư viện trên CDN bị sửa đổi, trình duyệt sẽ từ chối chạy. -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" crossorigin="anonymous"></script>
 
 <!-- Babel Standalone: cho phép viết JSX ngay trong file, không cần bước build -->
 <!-- Ghim phiên bản 7.x: bản "latest" (Babel 8) mặc định biên dịch JSX theo kiểu
      "automatic", tự chèn câu lệnh import — gây lỗi cú pháp vì script bên dưới
      không được khai báo là module. Bản 7.x biên dịch theo kiểu cũ (React.createElement),
      chạy tốt trong thẻ script thường. -->
-<script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js" integrity="sha384-ezQ6HS3FLspd9te19o2McUV6FAK091+GG7KO54f/R8DKgCDi7fULhapNrd5LY+vG" crossorigin="anonymous"></script>
 
 <!-- Firebase (bản "compat"): dùng để đăng nhập (Auth) và lưu dữ liệu nhiều
      người dùng (Firestore). Bản compat lộ ra biến toàn cục `firebase`, dùng
      được luôn trong thẻ <script> thường, không cần import kiểu module. -->
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js" integrity="sha384-AQ3POAMqIhwS81FrUH95ekxqBZHeP5tG2JfEL3+7GuTtfRLWnrRh32UxwzM+//A9" crossorigin="anonymous"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js" integrity="sha384-TnlRYaR4JYz/lpaGuaiU61PjNberSA4vjLjtF+oRC/IkohkJqnWxw5EmDSOt1vA1" crossorigin="anonymous"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js" integrity="sha384-qn4Jh88HhJA8dplNQyGjOh9OGI4izVhrfj/qIFgaKcdgOE06pXqIKGlsCILZcLAC" crossorigin="anonymous"></script>
 
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap');
@@ -2645,7 +2646,8 @@ function InviteForm({ centerId, centerName, notify }) {
     if (!normalized || !normalized.includes("@")) { notify("Nhập email hợp lệ của giáo viên.", "error"); return; }
     setBusy(true);
     try {
-      await db.collection("centers").doc(centerId).collection("invites").add({
+      // Mã lời mời = chính email được mời (luật bảo mật dựa vào đó để kiểm tra)
+      await db.collection("centers").doc(centerId).collection("invites").doc(normalized).set({
         email: normalized, centerName: centerName || "", status: "pending",
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
@@ -2841,7 +2843,21 @@ function TeacherCenterCard({ centerId, user }) {
 }
 
 function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCenterId, notify }) {
-  const pendingInvites = usePendingInvites(user.email);
+  const needVerify = !!user.email && !user.emailVerified;
+  const pendingInvites = usePendingInvites(needVerify ? null : (user.email || "").trim().toLowerCase());
+  const resendVerify = () => user.sendEmailVerification()
+    .then(() => notify(`Đã gửi thư xác minh tới ${user.email}. Mở email và bấm vào đường link nhé.`, "success"))
+    .catch(() => notify("Chưa gửi được thư (có thể do gửi quá nhiều lần), thử lại sau ít phút.", "error"));
+  const checkVerified = async () => {
+    try {
+      await user.reload();
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await auth.currentUser.getIdToken(true);
+        notify("Email đã được xác minh!", "success");
+        window.location.reload();
+      } else notify("Email vẫn chưa được xác minh — kiểm tra hộp thư (cả mục Spam) nhé.", "error");
+    } catch (e) { notify("Không kiểm tra được, thử lại nhé.", "error"); }
+  };
 
   const handleAccept = async (invite) => {
     try {
@@ -2854,7 +2870,8 @@ function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCent
       setCenterIds((prev) => (prev.includes(invite.centerId) ? prev : [...prev, invite.centerId]));
       notify(`Đã tham gia trung tâm "${invite.centerName || ""}".`, "success");
     } catch (err) {
-      notify("Không tham gia được, thử lại nhé.", "error");
+      if (err && err.code === "permission-denied") notify("Lời mời này đã cũ hoặc không hợp lệ — nhờ trung tâm gửi lại lời mời mới nhé.", "error");
+      else notify("Không tham gia được, thử lại nhé.", "error");
     }
   };
 
@@ -2864,6 +2881,15 @@ function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCent
 
   return (
     <div className="space-y-4">
+      {needVerify && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+          <p className="text-sm" style={{ color: INK }}>Để nhận lời mời vào trung tâm, bạn cần <strong>xác minh email {user.email}</strong>.</p>
+          <div className="flex gap-2">
+            <button onClick={resendVerify} className="rounded-full border px-3 py-1.5 text-xs font-medium" style={{ borderColor: BORDER, color: "#8A6070" }}>Gửi lại thư xác minh</button>
+            <button onClick={checkVerified} className="rounded-full px-3 py-1.5 text-xs font-semibold text-white" style={{ backgroundColor: PRIMARY }}>Tôi đã xác minh</button>
+          </div>
+        </div>
+      )}
       {pendingInvites.length > 0 && (
         <div className="space-y-2">
           {pendingInvites.map((inv) => (
@@ -2903,7 +2929,9 @@ function AuthScreen({ notify }) {
       if (mode === "signin") {
         await auth.signInWithEmailAndPassword(email.trim(), password);
       } else {
-        await auth.createUserWithEmailAndPassword(email.trim(), password);
+        const cred = await auth.createUserWithEmailAndPassword(email.trim(), password);
+        // Gửi thư xác minh email (bắt buộc trước khi nhận lời mời vào trung tâm)
+        if (cred && cred.user) cred.user.sendEmailVerification().catch(() => {});
       }
     } catch (err) {
       setError(mapAuthError(err.code));
