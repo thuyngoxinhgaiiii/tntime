@@ -868,12 +868,68 @@ function pullOwn(it, ev, tags) {
   return { op: { t: "block", kind: it.kind, id: it.id, key, fields }, sig: ownBlockSig(it.kind, key, { ...it.item, ...fields }, tags) };
 }
 
+/* Sự kiện của lịch TNTime → khối bận trên web (dùng khi khôi phục / giữ lại) */
+function evToBlock(ev, tags, id) {
+  const p = parseEvTime(ev);
+  if (!p) return null;
+  const m = /· ([^·]+)$/.exec(ev.description || "");
+  const lbl = m ? m[1].trim().toLowerCase() : "";
+  const tag = lbl ? (tags || []).find((t) => t.label.trim().toLowerCase() === lbl) : null;
+  const sum = ev.summary || "";
+  const note = (tag && sum === tag.label) || sum === "Bận" ? "" : sum;
+  return { p, block: { id, s: p.s, e: p.e, note, tag: tag ? tag.id : "" } };
+}
+const fmtHM = (min) => `${pad2(Math.floor(min / 60))}:${pad2(min % 60)}`;
+const WD_VI = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
+function descItem(kind, key, s, e, name) {
+  const when = kind === "weekly" ? `${WD_VI[Number(key)]} hằng tuần` : key.split("-").reverse().slice(0, 2).join("/");
+  return `${when} ${fmtHM(s)}–${fmtHM(e)}${name ? " · " + name : ""}`;
+}
+
+/* KHÔI PHỤC: dựng lại khung giờ bận đã mất trên web từ lịch "TNTime" trên
+   Google (kể cả sự kiện vừa bị xoá nếu Google còn giữ thông tin). */
+async function gcalRecoverCore(token, calId, st) {
+  const enc = encodeURIComponent;
+  const evs = await glistAll(token, `/calendars/${enc(calId)}/events`, { singleEvents: false, showDeleted: true });
+  const have = new Set();
+  [st.busySlots, st.busyOnce].forEach((m) => Object.keys(m || {}).forEach((k) => (m[k] || []).forEach((b) => have.add(b.id))));
+  const tagByLabel = (lbl) => (st.tags || []).find((t) => t.label.trim().toLowerCase() === String(lbl || "").trim().toLowerCase());
+  const weekly = {}, once = {}, taskFix = {};
+  const seen = new Set();
+  // sự kiện còn sống được ưu tiên hơn bản đã xoá
+  evs.sort((a, b) => (a.status === "cancelled") - (b.status === "cancelled"));
+  let n = 0;
+  for (const ev of evs) {
+    const pp = ev.extendedProperties && ev.extendedProperties.private;
+    const tid = pp && pp.tntimeId, kind = pp && pp.tntimeKind;
+    if (!tid || seen.has(tid)) continue;
+    const p = parseEvTime(ev);
+    if (!p) continue;
+    seen.add(tid);
+    if (kind === "task") {
+      const t = (st.tasks || []).find((x) => x.id === tid);
+      if (t && t.status !== "scheduled") { taskFix[tid] = { status: "scheduled", scheduledDate: p.dk, scheduledStart: p.s, g: null }; n++; }
+      continue;
+    }
+    if (have.has(tid)) continue;
+    const m = /· ([^·]+)$/.exec(ev.description || "");
+    const tag = (m && tagByLabel(m[1])) || null;
+    const note = tag && (ev.summary || "") === tag.label ? "" : (ev.summary === "Bận" ? "" : ev.summary || "");
+    const b = { id: tid, s: p.s, e: p.e, note, tag: tag ? tag.id : "", g: null };
+    if (kind === "weekly") { const k = String(p.di); (weekly[k] = weekly[k] || []).push(b); }
+    else { (once[p.dk] = once[p.dk] || []).push(b); }
+    n++;
+  }
+  return { weekly, once, taskFix, n };
+}
+
 /* Một lượt đồng bộ: đọc 2 bên, ghi lên Google, trả về danh sách thay đổi
    cần áp dụng cho dữ liệu trên web (ops). */
 async function gcalSyncCore(token, calId, st, fresh) {
   const tz = userTZ();
   const enc = encodeURIComponent;
   const ops = [];
+  const pending = []; // các thao tác XOÁ — chỉ làm khi người dùng đồng ý
   const stats = { up: 0, down: 0 };
   const today = startOfDay(new Date());
   const winStart = addDays(startOfWeek(today), -7), winEnd = addDays(today, 62);
@@ -890,16 +946,27 @@ async function gcalSyncCore(token, calId, st, fresh) {
     if (byTid[tid]) { await gdel(token, `${calPath}/${enc(ev.id)}`); stats.up++; continue; }
     byTid[tid] = ev;
   }
-  for (const it of ownItemList(st, tz, fresh)) {
+  const ownItems = ownItemList(st, tz, fresh);
+  for (const it of ownItems) {
     const ev = byTid[it.id];
     delete byTid[it.id];
     const g = it.item.g;
     if (!ev) {
       if (g && g.src === "own" && g.hash === it.sig) {
-        // Đã từng đồng bộ, web không đổi gì → bị xoá trên điện thoại / máy tính
-        if (it.kind === "task") ops.push({ t: "task", id: it.id, fields: { status: "pending", scheduledDate: null, scheduledStart: null, g: null } });
-        else ops.push({ t: "delBlock", kind: it.kind, id: it.id });
-        stats.down++;
+        // Đã từng đồng bộ, web không đổi gì → có vẻ bị xoá trên Google.
+        // KHÔNG tự xoá: hỏi người dùng. Không đồng ý → gửi lại lên Google.
+        const s0 = it.kind === "task" ? it.item.scheduledStart : it.item.s;
+        const e0 = it.kind === "task" ? it.item.scheduledStart + taskMinutes(it.item) : it.item.e;
+        pending.push({
+          side: "web", text: descItem(it.kind === "task" ? "once" : it.kind, it.key, s0, e0, it.summary),
+          del: async () => [it.kind === "task"
+            ? { t: "task", id: it.id, fields: { status: "pending", scheduledDate: null, scheduledStart: null, g: null } }
+            : { t: "delBlock", kind: it.kind, id: it.id }],
+          keep: async () => {
+            const res = await gapi(token, "POST", calPath, { body: it.body });
+            return [{ t: "meta", kind: it.kind, id: it.id, g: { src: "own", hash: it.sig, upd: res.updated } }];
+          },
+        });
         continue;
       }
       const res = await gapi(token, "POST", calPath, { body: it.body });
@@ -920,11 +987,31 @@ async function gcalSyncCore(token, calId, st, fresh) {
     }
   }
   // Sự kiện không còn tương ứng trên web (đã xoá khối / bỏ lịch việc) → xoá trên Google
+  // → KHÔNG tự xoá: hỏi người dùng. Không đồng ý → đưa lại vào web.
   for (const tid of Object.keys(byTid)) {
-    await gdel(token, `${calPath}/${enc(byTid[tid].id)}`);
-    stats.up++;
+    const ev = byTid[tid];
+    const kind = ev.extendedProperties.private.tntimeKind;
     const t = (st.tasks || []).find((x) => x.id === tid);
-    if (t && t.g) ops.push({ t: "task", id: tid, fields: { g: null } });
+    const conv = evToBlock(ev, st.tags, tid);
+    if (!conv) continue;
+    const { p, block } = conv;
+    pending.push({
+      side: "google", text: descItem(kind === "weekly" ? "weekly" : "once", kind === "weekly" ? String(p.di) : p.dk, p.s, p.e, ev.summary || ""),
+      del: async () => {
+        await gdel(token, `${calPath}/${enc(ev.id)}`);
+        return t && t.g ? [{ t: "task", id: tid, fields: { g: null } }] : [];
+      },
+      keep: async () => {
+        if (kind === "task" && t) {
+          const fields = { status: "scheduled", scheduledDate: p.dk, scheduledStart: p.s };
+          return [{ t: "task", id: tid, fields }, { t: "meta", kind: "task", id: tid, g: { src: "own", hash: ownTaskSig({ ...t, ...fields }, st.tags), upd: ev.updated } }];
+        }
+        const k2 = kind === "weekly" ? "weekly" : "once";
+        const key = k2 === "weekly" ? String(p.di) : p.dk;
+        const b = { ...block, g: k2 === kind ? { src: "own", hash: ownBlockSig(k2, key, block, st.tags), upd: ev.updated } : null };
+        return [{ t: "addBlock", kind: k2, key, block: b }];
+      },
+    });
   }
 
   /* ---- 2. Lịch chính trên Google → khung giờ bận trên web ---- */
@@ -966,21 +1053,31 @@ async function gcalSyncCore(token, calId, st, fresh) {
 
   // Khối nhập từ Google mà người dùng đã xoá trên web → xoá bên Google
   for (const tr of trash) {
+    const d0 = desired[tr.key];
     if (tr.kind === "weekly") {
       const master = masters[tr.id];
-      if (master) {
-        const days = [...new Set(localImp.filter((x) => x.kind === "weekly" && x.b.g.id === tr.id).map((x) => Number(x.key)))];
-        if (!days.length) await gdel(token, `${prim}/${enc(tr.id)}`);
-        else await gapi(token, "PATCH", `${prim}/${enc(tr.id)}`, { body: { recurrence: buildRRule(master.recurrence, days) } });
-        stats.up++;
-      }
       Object.keys(desired).forEach((k) => { if (desired[k].gid === tr.id && !localImp.some((x) => x.b.g.key === k)) used.add(k); });
+      if (!master) { ops.push({ t: "untrash", keys: [tr.key] }); continue; }
+      pending.push({
+        side: "google", text: d0 ? descItem("weekly", d0.key, d0.s, d0.e, d0.note) : (master.summary || "Sự kiện lặp lại"),
+        del: async () => {
+          const days = [...new Set(localImp.filter((x) => x.kind === "weekly" && x.b.g.id === tr.id).map((x) => Number(x.key)))];
+          if (!days.length) await gdel(token, `${prim}/${enc(tr.id)}`);
+          else await gapi(token, "PATCH", `${prim}/${enc(tr.id)}`, { body: { recurrence: buildRRule(master.recurrence, days) } });
+          return [{ t: "untrash", keys: [tr.key] }];
+        },
+        keep: async () => [{ t: "untrash", keys: [tr.key] }], // lần đồng bộ sau sẽ đưa lại vào web
+      });
     } else {
-      await gdel(token, `${prim}/${enc(tr.id)}`);
-      stats.up++;
+      if (!d0) { ops.push({ t: "untrash", keys: [tr.key] }); continue; }
+      used.add(tr.key);
+      pending.push({
+        side: "google", text: descItem("once", d0.key, d0.s, d0.e, d0.note),
+        del: async () => { await gdel(token, `${prim}/${enc(tr.id)}`); return [{ t: "untrash", keys: [tr.key] }]; },
+        keep: async () => [{ t: "untrash", keys: [tr.key] }],
+      });
     }
   }
-  if (trash.length) ops.push({ t: "untrash", keys: trash.map((x) => x.key) });
 
   const groups = {};
   for (const x of localImp) {
@@ -1000,14 +1097,14 @@ async function gcalSyncCore(token, calId, st, fresh) {
         if (d) used.add(g.key);
         continue;
       }
-      if (!localChanged) { ops.push({ t: "delBlock", kind, id: b.id }); stats.down++; }
+      if (!localChanged) { pending.push({ side: "web", text: descItem(kind, key, b.s, b.e, b.note), del: async () => [{ t: "delBlock", kind, id: b.id }], keep: async () => [{ t: "meta", kind, id: b.id, g: null }] }); }
       else ops.push({ t: "meta", kind, id: b.id, g: null });
       continue;
     }
     if (!d) {
       const origDk = g.dk || key;
       if (origDk < winStartKey || origDk > winEndKey) continue;
-      if (!localChanged) { ops.push({ t: "delBlock", kind, id: b.id }); stats.down++; }
+      if (!localChanged) { pending.push({ side: "web", text: descItem(kind, key, b.s, b.e, b.note), del: async () => [{ t: "delBlock", kind, id: b.id }], keep: async () => [{ t: "meta", kind, id: b.id, g: null }] }); }
       else ops.push({ t: "meta", kind, id: b.id, g: null });
       continue;
     }
@@ -1056,7 +1153,7 @@ async function gcalSyncCore(token, calId, st, fresh) {
     ops.push({ t: "addBlock", kind: d.kind, key: d.key, block: b });
     stats.down++;
   }
-  return { ops, stats };
+  return { ops, stats, pending };
 }
 
 /* --- Giao diện ----------------------------------------------------------- */
@@ -1107,7 +1204,7 @@ function GcalCard() {
             </p>
           ) : (
             <p className="mt-1 text-xs leading-relaxed" style={{ color: MUTED }}>
-              Khung giờ bận và việc đã sắp xếp sẽ hiện trong lịch <b>“TNTime”</b> trên Google Calendar. Sự kiện bạn thêm vào lịch chính của Google (trên điện thoại / máy tính) sẽ tự thành khung giờ bận ở đây, chưa gắn tag. Sửa hoặc xoá ở bên nào, bên kia cũng cập nhật theo mỗi khi mở web.
+              Khung giờ bận và việc đã sắp xếp sẽ hiện trong lịch <b>“TNTime”</b> trên Google Calendar. Sự kiện bạn thêm vào lịch chính của Google (trên điện thoại / máy tính) sẽ tự thành khung giờ bận ở đây, chưa gắn tag. Thêm hoặc sửa ở bên nào, bên kia cũng cập nhật theo mỗi khi mở web. Việc xoá thì web luôn hỏi bạn trước, không bao giờ tự xoá.
             </p>
           )}
         </div>
@@ -1115,6 +1212,7 @@ function GcalCard() {
           {gc.enabled ? (
             <>
               <button data-gcal-btn onClick={gc.syncNow} disabled={st.state === "syncing"} className={btn + " text-white disabled:opacity-60"} style={{ backgroundColor: PRIMARY }}><RefreshIcon size={13} /> Đồng bộ ngay</button>
+              <button data-gcal-btn onClick={gc.recover} disabled={st.state === "syncing"} className={btn + " border disabled:opacity-60"} style={{ borderColor: PRIMARY, color: PRIMARY }} title="Lấy lại các khung giờ bận bị mất từ lịch TNTime trên Google và bản sao lưu">↺ Khôi phục khung giờ bị mất</button>
               <button onClick={gc.disconnect} className={btn + " border"} style={{ borderColor: BORDER, color: "#8A6070" }}>Ngắt kết nối</button>
             </>
           ) : (
@@ -3036,7 +3134,7 @@ function App() {
     const taskOps = [];
     let untrash = null;
     ops.forEach((op) => {
-      if (op.t === "untrash") untrash = op.keys;
+      if (op.t === "untrash") untrash = [...(untrash || []), ...op.keys];
       else if (op.t === "task" || op.kind === "task") taskOps.push(op);
       else mapOps[op.kind].push(op);
     });
@@ -3079,7 +3177,28 @@ function App() {
       const cal = await ensureGcalCalendar(g.token.token, st.gcal.calendarId);
       if (cal.id !== st.gcal.calendarId) setGcal((prev) => ({ ...prev, calendarId: cal.id }));
       // Lịch TNTime vừa được tạo mới (VD: đã bị xoá trên Google) → gửi lại tất cả, không coi là "bị xoá"
-      const { ops, stats } = await gcalSyncCore(g.token.token, cal.id, stateRef.current, cal.created);
+      const { ops, stats, pending } = await gcalSyncCore(g.token.token, cal.id, stateRef.current, cal.created);
+      // Đồng bộ chỉ THÊM / SỬA. Mọi thao tác xoá phải được người dùng đồng ý.
+      if (pending.length) {
+        const onWeb = pending.filter((x) => x.side === "web"), onG = pending.filter((x) => x.side === "google");
+        const list = (arr) => arr.slice(0, 12).map((x) => "  • " + x.text).join("\n") + (arr.length > 12 ? `\n  … và ${arr.length - 12} mục khác` : "");
+        let msg = "ĐỒNG BỘ GOOGLE CALENDAR — CẦN BẠN XÁC NHẬN XOÁ\n\n";
+        if (onWeb.length) msg += `Không còn trên Google, sẽ XOÁ khỏi web (${onWeb.length}):\n${list(onWeb)}\n\n`;
+        if (onG.length) msg += `Đã xoá trên web, sẽ XOÁ khỏi Google (${onG.length}):\n${list(onG)}\n\n`;
+        msg += "Bấm OK để XOÁ.\nBấm Huỷ để GIỮ LẠI (khung giờ sẽ được thêm lại vào bên bị thiếu).";
+        const agree = window.confirm(msg);
+        for (const x of pending) {
+          const more = await (agree ? x.del() : x.keep());
+          ops.push(...more);
+          if (agree) stats.down++; else stats.up++;
+        }
+        notify(agree ? `Đã xoá ${pending.length} khung giờ theo xác nhận của bạn.` : `Đã giữ lại ${pending.length} khung giờ.`, "success");
+      }
+      // Trước khi xoá bất cứ gì trên web: lưu 1 bản sao lưu lên máy chủ
+      if (user && ops.some((o) => o.t === "delBlock" || (o.t === "task" && o.fields && o.fields.status === "pending"))) {
+        const s0 = stateRef.current;
+        await db.collection("users").doc(user.uid).set({ gcalBackup: clean({ at: new Date().toISOString(), busySlots: s0.busySlots, busyOnce: s0.busyOnce, tasks: s0.tasks }) }, { merge: true }).catch(() => {});
+      }
       if (ops.length) applyGcalOps(ops);
       setGcalStatus({ state: "ok", last: Date.now(), stats });
     } catch (err) {
@@ -3095,7 +3214,7 @@ function App() {
       g.syncing = false;
       if (g.again) { g.again = false; setTimeout(() => runGcalSync(), 800); }
     }
-  }, [applyGcalOps, user]);
+  }, [applyGcalOps, user, notify]);
 
   /* Lấy quyền Google (popup) — phải gọi ngay trong 1 cú bấm */
   const acquireGcalToken = useCallback((interactive) => {
@@ -3160,6 +3279,51 @@ function App() {
     setGcalStatus({ state: "idle" });
   }, [user]);
 
+  /* Khôi phục khung giờ bận bị mất: lấy lại từ lịch "TNTime" trên Google,
+     hoặc từ bản sao lưu tự động trên máy chủ. */
+  const gcalRecover = useCallback(async () => {
+    const g = gcalRef.current;
+    const st = stateRef.current;
+    let tok = g.token && g.token.exp > Date.now() ? g.token : null;
+    try {
+      if (!tok) tok = await acquireGcalToken(false);
+      g.syncing = true; // tạm dừng tự đồng bộ trong lúc khôi phục
+      setGcalStatus((s) => ({ ...s, state: "syncing" }));
+      const cal = await ensureGcalCalendar(tok.token, st.gcal.calendarId);
+      const r = await gcalRecoverCore(tok.token, cal.id, st);
+      let n = r.n;
+      // Bổ sung từ bản sao lưu trên máy chủ (nếu có)
+      if (user) {
+        const snap = await db.collection("users").doc(user.uid).get();
+        const bk = snap.exists && snap.data().gcalBackup;
+        if (bk) {
+          const haveIds = new Set();
+          [st.busySlots, st.busyOnce, r.weekly, r.once].forEach((m) => Object.keys(m || {}).forEach((k) => (m[k] || []).forEach((b) => haveIds.add(b.id))));
+          [["weekly", bk.busySlots], ["once", bk.busyOnce]].forEach(([kind, m]) => Object.keys(m || {}).forEach((k) => (m[k] || []).forEach((b) => {
+            if (haveIds.has(b.id)) return;
+            haveIds.add(b.id);
+            const tgt = kind === "weekly" ? r.weekly : r.once;
+            (tgt[k] = tgt[k] || []).push({ ...b, g: null });
+            n++;
+          })));
+        }
+      }
+      if (!n) { notify("Không tìm thấy khung giờ nào để khôi phục.", "error"); setGcalStatus((s) => ({ ...s, state: "ok" })); return; }
+      const merge = (add) => (prev) => { const m = { ...prev }; Object.keys(add).forEach((k) => { m[k] = [...(m[k] || []), ...add[k]]; }); return m; };
+      setBusySlots(merge(r.weekly));
+      setBusyOnce(merge(r.once));
+      if (Object.keys(r.taskFix).length) setTasks((p) => p.map((t) => (r.taskFix[t.id] ? { ...t, ...r.taskFix[t.id] } : t)));
+      setGcalStatus((s) => ({ ...s, state: "ok" }));
+      notify(`Đã khôi phục ${n} khung giờ / việc. Hãy kiểm tra lại lịch nhé!`, "success");
+    } catch (err) {
+      if (err.message === "busy") return;
+      setGcalStatus((s) => ({ ...s, state: "error", msg: "Khôi phục lỗi: " + err.message }));
+      notify("Khôi phục lỗi: " + err.message, "error");
+    } finally {
+      g.syncing = false;
+    }
+  }, [acquireGcalToken, notify, user]);
+
   const gcalTrashBlock = useCallback((kind, block) => {
     if (!block || !block.g || block.g.src !== "import") return;
     setGcalTrash((prev) => (prev.some((x) => x.key === block.g.key) ? prev : [...prev, { kind, key: block.g.key, id: block.g.id, day: block.g.day == null ? null : block.g.day }]));
@@ -3216,6 +3380,7 @@ function App() {
     syncNow: gcalSyncNow,
     disconnect: gcalDisconnect,
     trashBlock: gcalTrashBlock,
+    recover: gcalRecover,
   };
 
 
