@@ -177,14 +177,16 @@ const DAYS = [
   { short: "CN", full: "Chủ nhật" },
 ];
 
-const HOUR_START = 6;
-const HOUR_END = 22;
+const HOUR_START = 0;
+const HOUR_END = 23;
 const HOURS = Array.from({ length: HOUR_END - HOUR_START + 1 }, (_, i) => HOUR_START + i);
 
 /* Khung thời gian trong ngày tính theo phút (dùng cho khung giờ rảnh chính
-   xác tới từng phút). Ngày bắt đầu 6:00, kết thúc 23:00. */
-const DAY_START_MIN = HOUR_START * 60; // 360  = 6:00
-const DAY_END_MIN = (HOUR_END + 1) * 60; // 1380 = 23:00
+   xác tới từng phút). Cả ngày 24 giờ: 0:00 → 24:00. */
+const DAY_START_MIN = HOUR_START * 60; // 0    = 0:00
+const DAY_END_MIN = (HOUR_END + 1) * 60; // 1440 = 24:00
+/* Khung giờ mặc định trợ lý tự sắp việc (tránh xếp việc lúc nửa đêm) */
+const AUTO_WIN_DEFAULT = { s: 6 * 60, e: 23 * 60 };
 const TIME_STEP_MIN = 5;
 
 /* ---------------------------------------------------------------------- */
@@ -559,7 +561,8 @@ function placementError(busySlots, busyOnce, tasks, task, dk, s) {
   return null;
 }
 
-function autoSchedule(tasks, busySlots, busyOnce) {
+function autoSchedule(tasks, busySlots, busyOnce, win = AUTO_WIN_DEFAULT) {
+  const ws = Math.max(DAY_START_MIN, win.s), we = Math.min(DAY_END_MIN, win.e);
   const working = tasks.map((t) => ({ ...t }));
   const today = startOfDay(new Date());
   const tk = dateKey(today);
@@ -576,8 +579,8 @@ function autoSchedule(tasks, busySlots, busyOnce) {
       const dk = dateKey(addDays(today, i));
       if (dk > t.deadlineDate) break;
       if (t.startDate && dk < t.startDate) continue;
-      const minStart = dk === tk ? Math.max(DAY_START_MIN, Math.ceil(nowM / PLAN_STEP_MIN) * PLAN_STEP_MIN) : DAY_START_MIN;
-      const maxEnd = dk === t.deadlineDate ? Math.min(DAY_END_MIN, t.deadlineMin) : DAY_END_MIN;
+      const minStart = dk === tk ? Math.max(ws, Math.ceil(nowM / PLAN_STEP_MIN) * PLAN_STEP_MIN) : ws;
+      const maxEnd = dk === t.deadlineDate ? Math.min(we, t.deadlineMin) : we;
       for (let s = minStart; s + dm <= maxEnd; s += PLAN_STEP_MIN) {
         if (isSlotFree(busySlots, busyOnce, working, dk, s, s + dm, t.id)) {
           const r = { status: "scheduled", scheduledDate: dk, scheduledStart: s };
@@ -776,6 +779,7 @@ async function ensureGcalCalendar(token, calId) {
 /* --- Chuyển đổi dữ liệu -------------------------------------------------- */
 
 function gDT(dk, min, tz) {
+  if (min >= 1440) { dk = dateKey(addDays(parseKey(dk), Math.floor(min / 1440))); min = min % 1440; }
   return { dateTime: `${dk}T${pad2(Math.floor(min / 60))}:${pad2(min % 60)}:00`, timeZone: tz };
 }
 /* Giờ của sự kiện (theo múi giờ máy) → { dk, di, s, e }; bỏ sự kiện cả ngày */
@@ -1256,13 +1260,13 @@ function GcalCard() {
 /*  - Giãn 2 ngón để phóng to: tháng → tuần, tuần → giãn cao các giờ        */
 /* ---------------------------------------------------------------------- */
 
-const ROW_MIN = 20;
+const ROW_MIN = 14;
 const ROW_MAX = 72;
 
 function useCalendarState() {
   const [mode, setMode] = useState("week");
   const [anchor, setAnchor] = useState(() => startOfDay(new Date()));
-  const [rowH, setRowH] = useState(34);
+  const [rowH, setRowH] = useState(26);
   const weekStart = startOfWeek(anchor);
   const dates = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
   return { mode, setMode, anchor, setAnchor, rowH, setRowH, weekStart, dates };
@@ -1399,6 +1403,13 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
   pxRef.current = pxPerMin;
   const totalHeight = HOURS.length * rowH;
   const tk = todayKey();
+  const scrollRef = useRef(null);
+  // Mở lịch: cuộn tới quanh giờ hiện tại (nếu tuần có hôm nay), không thì 7:00
+  useEffect(() => {
+    const el = scrollRef.current; if (!el) return;
+    const h = dates.some((d) => dateKey(d) === tk) ? new Date().getHours() - 1 : 7;
+    el.scrollTop = Math.max(0, h) * rowH;
+  }, []);
 
   const dragRef = useRef(null);
   const [draft, setDraft] = useState(null);
@@ -1530,15 +1541,14 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
   };
 
   return (
-    <div className="overflow-x-auto">
+    <div ref={scrollRef} className="overflow-auto rounded-xl" style={{ maxHeight: "72vh" }}>
       <div className="flex select-none" style={{ minWidth: 640 }}>
-        <div style={{ width: labelW, flexShrink: 0 }}>
-          <div style={{ height: 36 }} />
+        <div style={{ width: labelW, flexShrink: 0, position: "sticky", left: 0, zIndex: 6, backgroundColor: "#FFFFFF" }}>
+          <div style={{ height: 36, position: "sticky", top: 0, zIndex: 7, backgroundColor: "#FFFFFF", borderBottom: "1px solid #FBEAF1" }} />
           <div style={{ position: "relative", height: totalHeight }}>
             {HOURS.map((h) => (
-              <div key={h} style={{ position: "absolute", top: (h - HOUR_START) * rowH - 6, right: 6, fontSize: 11, color: MUTED_LIGHT }}>{h}:00</div>
+              <div key={h} style={{ position: "absolute", top: Math.max(1, (h - HOUR_START) * rowH - 6), right: 6, fontSize: 10.5, color: MUTED_LIGHT }}>{pad2(h)}:00</div>
             ))}
-            <div style={{ position: "absolute", top: totalHeight - 6, right: 6, fontSize: 11, color: MUTED_LIGHT }}>{HOUR_END + 1}:00</div>
           </div>
         </div>
         {dates.map((d) => {
@@ -1550,7 +1560,7 @@ function WeekCalendar({ dates, rowH, busySlots, busyOnce, tasks, mode, onCreateD
           const dayTasks = tasks.filter((t) => t.status === "scheduled" && t.scheduledDate === dk);
           return (
             <div key={dk} style={{ flex: 1, minWidth: 64 }}>
-              <div className="flex flex-col items-center justify-end pb-1 leading-tight" style={{ height: 36 }}>
+              <div className="flex flex-col items-center justify-end pb-1 leading-tight" style={{ height: 36, position: "sticky", top: 0, zIndex: 5, backgroundColor: "#FFFFFF", borderBottom: "1px solid #FBEAF1", boxShadow: "0 2px 4px -3px rgba(74,46,62,0.15)" }}>
                 <span className="text-xs font-semibold" style={{ color: isToday ? "#FFFFFF" : PRIMARY, backgroundColor: isToday ? PRIMARY : "transparent", borderRadius: 999, padding: "0 8px", fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{DAYS[di].short}</span>
                 <span className="text-[10.5px]" style={{ color: isToday ? PRIMARY : MUTED_LIGHT, fontWeight: isToday ? 700 : 400 }}>{fmtDM(d)}</span>
               </div>
@@ -1913,17 +1923,18 @@ function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks,
 /*  Ô nhập giờ — gõ tự do chính xác từng phút, không tự làm tròn khi gõ     */
 /* ---------------------------------------------------------------------- */
 
-function TimeField({ label, value, onChange }) {
-  const [draft, setDraft] = useState(minToHHMM(value));
+function TimeField({ label, value, onChange, isEnd }) {
+  const show = (v) => minToHHMM(v >= 1440 ? v - 1440 : v);
+  const [draft, setDraft] = useState(show(value));
   const focused = useRef(false);
   // Giá trị đổi từ bên ngoài (kéo trên lịch) → cập nhật ô, trừ khi đang gõ
-  useEffect(() => { if (!focused.current) setDraft(minToHHMM(value)); }, [value]);
+  useEffect(() => { if (!focused.current) setDraft(show(value)); }, [value]);
   const parse = (str) => {
     const m = /^(\d{1,2}):(\d{2})/.exec(str || "");
     if (!m) return null;
     const h = Number(m[1]), mm = Number(m[2]);
     if (h > 23 || mm > 59) return null;
-    return h * 60 + mm;
+    return isEnd && h === 0 && mm === 0 ? 1440 : h * 60 + mm;
   };
   return (
     <div>
@@ -2058,7 +2069,7 @@ function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, last
           </div>
         )}
         <TimeField label="Bắt đầu" value={editing.s} onChange={(v) => setTime({ s: v })} />
-        <TimeField label="Kết thúc" value={editing.e} onChange={(v) => setTime({ e: v })} />
+        <TimeField label="Kết thúc" isEnd value={editing.e} onChange={(v) => setTime({ e: v })} />
         <div className="min-w-[180px] flex-1">
           <label className="mb-1 block text-xs" style={{ color: MUTED }}>Đang bận việc gì?</label>
           <input value={editing.note} onChange={(ev) => setField({ note: ev.target.value })} placeholder="VD: Dạy lớp HSK3" className="w-full rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
@@ -2232,6 +2243,11 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
   const tags = useTags();
   const tk = todayKey();
   const maxKey = dateKey(addDays(new Date(), PLAN_WINDOW_DAYS));
+  const [autoWin, setAutoWin] = useState(() => {
+    try { const w = JSON.parse(localStorage.getItem("tn_autowin") || "null"); if (w && w.e > w.s) return w; } catch (e) {}
+    return AUTO_WIN_DEFAULT;
+  });
+  useEffect(() => { try { localStorage.setItem("tn_autowin", JSON.stringify(autoWin)); } catch (e) {} }, [autoWin]);
   const [form, setForm] = useState(() => ({ name: "", category: "dayhoc", duration: 1.5, startDate: todayKey(), deadlineDate: dateKey(addDays(new Date(), 7)), deadlineMin: 18 * 60 }));
 
   const deadlineOptions = [];
@@ -2259,7 +2275,7 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
   const unschedule = (id) => setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: "pending", scheduledDate: null, scheduledStart: null } : t)));
 
   const runAuto = () => {
-    const results = autoSchedule(tasks, busySlots, busyOnce);
+    const results = autoSchedule(tasks, busySlots, busyOnce, autoWin);
     const ids = Object.keys(results);
     if (!ids.length) { notify("Không có việc nào đang chờ sắp xếp.", "error"); return; }
     setTasks((prev) => prev.map((t) => (results[t.id] ? { ...t, ...results[t.id] } : t)));
@@ -2344,7 +2360,18 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
             <Sparkles size={15} /> Sắp xếp thông minh
           </button>
         </div>
-        <ExcelImport tasks={tasks} setTasks={setTasks} busySlots={busySlots} busyOnce={busyOnce} notify={notify} />
+        <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: MUTED }}>
+          <span>Trợ lý chỉ tự xếp việc trong khung</span>
+          <select value={autoWin.s} onChange={(e) => { const v = Number(e.target.value); setAutoWin((w) => ({ s: v, e: Math.max(w.e, v + 60) })); }} className="rounded-lg border px-1.5 py-1 text-xs" style={{ borderColor: BORDER, color: INK, backgroundColor: "#FFFFFF" }}>
+            {Array.from({ length: 24 }, (_, h) => h * 60).map((m) => <option key={m} value={m}>{minToHHMM(m)}</option>)}
+          </select>
+          <span>–</span>
+          <select value={autoWin.e} onChange={(e) => { const v = Number(e.target.value); setAutoWin((w) => ({ s: Math.min(w.s, v - 60), e: v })); }} className="rounded-lg border px-1.5 py-1 text-xs" style={{ borderColor: BORDER, color: INK, backgroundColor: "#FFFFFF" }}>
+            {Array.from({ length: 24 }, (_, h) => (h + 1) * 60).map((m) => <option key={m} value={m}>{minToHHMM(m)}</option>)}
+          </select>
+          <span style={{ color: MUTED_LIGHT }}>(kéo tay thì đặt được bất kì giờ nào)</span>
+        </div>
+        <ExcelImport tasks={tasks} setTasks={setTasks} busySlots={busySlots} busyOnce={busyOnce} notify={notify} autoWin={autoWin} />
         {pending.length === 0 ? (
           <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed p-8 text-center" style={{ borderColor: BORDER }}>
             <Flower size={30} petal={PRIMARY} center={SECONDARY} />
@@ -2464,7 +2491,7 @@ function LoadingScreen({ label = "Đang tải..." }) {
 /* ---------------------------------------------------------------------- */
 
 function AssignmentGrid({ busySlots, assignments, onCreateDraft, onSelectAssignment }) {
-  const rowH = 26;
+  const rowH = 20;
   const labelW = 46;
   const pxPerMin = rowH / 60;
   const totalHeight = HOURS.length * rowH;
@@ -2512,20 +2539,22 @@ function AssignmentGrid({ busySlots, assignments, onCreateDraft, onSelectAssignm
     };
   }, [onCreateDraft]);
 
+  const gridScrollRef = useRef(null);
+  useEffect(() => { if (gridScrollRef.current) gridScrollRef.current.scrollTop = 7 * rowH; }, []);
   return (
-    <div className="overflow-x-auto">
+    <div ref={gridScrollRef} className="overflow-auto rounded-xl" style={{ maxHeight: "65vh" }}>
       <div className="flex select-none" style={{ minWidth: 560 }}>
-        <div style={{ width: labelW, flexShrink: 0 }}>
-          <div style={{ height: 20 }} />
+        <div style={{ width: labelW, flexShrink: 0, position: "sticky", left: 0, zIndex: 6, backgroundColor: "#FFFFFF" }}>
+          <div style={{ height: 20, position: "sticky", top: 0, zIndex: 7, backgroundColor: "#FFFFFF" }} />
           <div style={{ position: "relative", height: totalHeight }}>
             {HOURS.map((h) => (
-              <div key={h} style={{ position: "absolute", top: (h - HOUR_START) * rowH - 6, right: 4, fontSize: 9.5, color: MUTED_LIGHT }}>{h}:00</div>
+              <div key={h} style={{ position: "absolute", top: Math.max(1, (h - HOUR_START) * rowH - 6), right: 4, fontSize: 9.5, color: MUTED_LIGHT }}>{pad2(h)}:00</div>
             ))}
           </div>
         </div>
         {DAYS.map((d, di) => (
           <div key={d.short} style={{ flex: 1, minWidth: 56 }}>
-            <div className="flex items-end justify-center pb-1 text-[10.5px] font-semibold" style={{ height: 20, color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
+            <div className="flex items-end justify-center pb-1 text-[10.5px] font-semibold" style={{ height: 20, position: "sticky", top: 0, zIndex: 5, backgroundColor: "#FFFFFF", borderBottom: "1px solid #FBEAF1", color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
             <div
               className="daycol"
               onMouseDown={handleMouseDown(di)}
@@ -3157,7 +3186,7 @@ function rowToTask(row, tags, XLSX) {
   };
 }
 
-function ExcelImport({ tasks, setTasks, busySlots, busyOnce, notify }) {
+function ExcelImport({ tasks, setTasks, busySlots, busyOnce, notify, autoWin }) {
   const tags = useTags();
   const [busy, setBusy] = useState(false);
   const [rows, setRows] = useState(null); // [{ errs, catNote, task }]
@@ -3231,7 +3260,7 @@ function ExcelImport({ tasks, setTasks, busySlots, busyOnce, notify }) {
     const newTasks = okRows.map((r) => r.task);
     if (autoRun) {
       const all = [...tasks, ...newTasks];
-      const results = autoSchedule(all, busySlots, busyOnce);
+      const results = autoSchedule(all, busySlots, busyOnce, autoWin);
       setTasks(all.map((t) => (results[t.id] ? { ...t, ...results[t.id] } : t)));
       const ok = newTasks.filter((t) => results[t.id] && results[t.id].status === "scheduled").length;
       notify(`Đã thêm ${newTasks.length} việc, sắp xếp được ${ok}${ok < newTasks.length ? `, còn ${newTasks.length - ok} việc chưa tìm được chỗ trống` : ""}.`, ok < newTasks.length ? "error" : "success");
