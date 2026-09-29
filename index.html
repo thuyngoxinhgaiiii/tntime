@@ -606,6 +606,54 @@ function totalAssignedMinutes(assignmentsByDay) {
   return DAYS.reduce((sum, _d, di) => sum + ((assignmentsByDay[di] || []).reduce((s, a) => s + (a.e - a.s), 0)), 0);
 }
 
+
+/* ---------------------------------------------------------------------- */
+/*  Báo cáo giờ bận theo tháng                                            */
+/*  Giờ bận của 1 ngày = khung giờ bận (lặp + 1 lần) + việc đã sắp xếp,    */
+/*  phần trùng nhau chỉ tính 1 lần.                                       */
+/* ---------------------------------------------------------------------- */
+
+const OVERWORK_HOURS = 50;      // ngưỡng bận / tuần để nhắc giữ sức khoẻ
+const MIN_USE_DAYS = 14;        // dùng đủ 2 tuần mới tính trung bình
+
+function busyMinOnDate(busySlots, busyOnce, tasks, dk) {
+  const list = busyForDate(busySlots || {}, busyOnce || {}, dk, weekdayIdx(parseKey(dk))).map((b) => [b.s, b.e]);
+  (tasks || []).forEach((t) => {
+    if (t && t.status === "scheduled" && t.scheduledDate === dk && t.scheduledStart != null) list.push([Number(t.scheduledStart), Number(t.scheduledStart) + taskMinutes(t)]);
+  });
+  return normalizeIntervals(list).reduce((sum, [a, b]) => sum + (b - a), 0);
+}
+
+function weekBusyMin(busySlots, busyOnce, tasks, weekStart) {
+  let m = 0;
+  for (let i = 0; i < 7; i++) m += busyMinOnDate(busySlots, busyOnce, tasks, dateKey(addDays(weekStart, i)));
+  return m;
+}
+
+/* Thống kê tháng (y, mo: 0–11). sinceKey = ngày bắt đầu dùng TNTime (có thể null).
+   avgWeekMin chỉ có khi đã dùng đủ 2 tuần và tháng đó có ít nhất 7 ngày được tính. */
+function monthBusyStats(busySlots, busyOnce, tasks, y, mo, sinceKey) {
+  const first = new Date(y, mo, 1), last = new Date(y, mo + 1, 0);
+  const tk = todayKey();
+  let totalMin = 0, countedMin = 0, countedDays = 0;
+  const weeks = [];
+  for (let d = first; d <= last; d = addDays(d, 1)) {
+    const dk = dateKey(d);
+    const m = busyMinOnDate(busySlots, busyOnce, tasks, dk);
+    totalMin += m;
+    if (!sinceKey || dk >= sinceKey) { countedMin += m; countedDays++; }
+    const ws = dateKey(startOfWeek(d));
+    if (!weeks.length || weeks[weeks.length - 1].ws !== ws) weeks.push({ ws, from: d, to: d, min: 0 });
+    const w = weeks[weeks.length - 1]; w.to = d; w.min += m;
+  }
+  const usedDays = sinceKey ? Math.round((parseKey(tk) - parseKey(sinceKey)) / 86400000) : MIN_USE_DAYS;
+  const eligible = usedDays >= MIN_USE_DAYS;
+  const avgWeekMin = eligible && countedDays >= 7 ? (countedMin / countedDays) * 7 : null;
+  return { totalMin, avgWeekMin, eligible, usedDays, countedDays, weeks };
+}
+
+const displayNameOf = (u) => ((u && (u.displayName || u.name)) || "").trim() || String((u && u.email) || "bạn").split("@")[0];
+
 /* ---------------------------------------------------------------------- */
 /*  Small UI atoms                                                        */
 /* ---------------------------------------------------------------------- */
@@ -1736,7 +1784,78 @@ function MonthCalendar({ anchor, busySlots, busyOnce, tasks, onPickDay }) {
 /*  View: Dashboard                                                       */
 /* ---------------------------------------------------------------------- */
 
-function DashboardView({ busySlots, busyOnce, tasks, onDropTask }) {
+/* Nhắc giữ sức khoẻ khi tuần này bận trên 50 giờ (ẩn được cho tới tuần sau) */
+function CareBanner({ user, busySlots, busyOnce, tasks }) {
+  const ws = startOfWeek(new Date());
+  const key = `tn_care_${dateKey(ws)}`;
+  const [hidden, setHidden] = useState(() => { try { return !!localStorage.getItem(key); } catch (e) { return false; } });
+  const hours = weekBusyMin(busySlots, busyOnce, tasks, ws) / 60;
+  if (hidden || hours <= OVERWORK_HOURS) return null;
+  return (
+    <div className="mb-4 flex items-start gap-3 rounded-2xl border p-4" style={{ borderColor: "#F7C9DA", background: "linear-gradient(90deg, #FDEDF4 0%, #FFF6E5 100%)" }}>
+      <span style={{ fontSize: 26, lineHeight: 1 }}>🌷</span>
+      <div className="flex-1">
+        <p className="text-sm font-semibold" style={{ color: INK }}>{displayNameOf(user)} ơi, bạn đã vượt qua {OVERWORK_HOURS}h làm việc/tuần, hãy giữ gìn sức khoẻ nhé!</p>
+        <p className="mt-0.5 text-xs" style={{ color: "#9C6B80" }}>Tuần này bạn bận khoảng {formatHours(Math.round(hours * 2) / 2)}. Nhớ ngủ đủ giấc, uống nhiều nước và dành chút thời gian nghỉ ngơi cho bản thân nhé 💛</p>
+      </div>
+      <button onClick={() => { setHidden(true); try { localStorage.setItem(key, "1"); } catch (e) {} }} className="rounded p-1 hover:bg-black/5" style={{ color: MUTED }} title="Ẩn tới tuần sau"><XIcon size={14} /></button>
+    </div>
+  );
+}
+
+/* Báo cáo giờ bận theo tháng: tổng giờ, trung bình / tuần, từng tuần */
+function MonthlyReport({ user, busySlots, busyOnce, tasks }) {
+  const [ym, setYm] = useState(() => { const n = new Date(); return { y: n.getFullYear(), m: n.getMonth() }; });
+  const ct = user && user.metadata && user.metadata.creationTime ? new Date(user.metadata.creationTime) : null;
+  const sinceKey = ct && !isNaN(ct) ? dateKey(ct) : null;
+  const st = monthBusyStats(busySlots, busyOnce, tasks, ym.y, ym.m, sinceKey);
+  const shift = (k) => setYm(({ y, m }) => { const d = new Date(y, m + k, 1); return { y: d.getFullYear(), m: d.getMonth() }; });
+  const maxW = Math.max(1, ...st.weeks.map((w) => w.min));
+  const over = st.avgWeekMin != null && st.avgWeekMin / 60 > OVERWORK_HOURS;
+  return (
+    <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <p className="text-sm font-medium" style={{ color: INK }}>Báo cáo giờ bận</p>
+        <div className="ml-auto flex items-center gap-1">
+          <button onClick={() => shift(-1)} className="rounded-full border p-1" style={{ borderColor: BORDER, color: MUTED }}><ChevronLeft size={14} /></button>
+          <span className="w-24 text-center text-sm font-semibold" style={{ color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>Tháng {ym.m + 1}/{ym.y}</span>
+          <button onClick={() => shift(1)} className="rounded-full border p-1" style={{ borderColor: BORDER, color: MUTED }}><ChevronRight size={14} /></button>
+        </div>
+      </div>
+      <div className="mb-3 grid grid-cols-2 gap-3">
+        <div className="rounded-xl p-3" style={{ backgroundColor: "#FFF3F8" }}>
+          <p className="text-[11px]" style={{ color: MUTED }}>Tổng giờ bận cả tháng</p>
+          <p className="text-xl font-bold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{formatDuration(st.totalMin)}</p>
+        </div>
+        <div className="rounded-xl p-3" style={{ backgroundColor: over ? "#FEF2F5" : "#FFF8E8" }}>
+          <p className="text-[11px]" style={{ color: MUTED }}>Trung bình mỗi tuần</p>
+          {st.avgWeekMin != null ? (
+            <p className="text-xl font-bold" style={{ color: over ? DANGER : INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{formatHours(Math.round(st.avgWeekMin / 30) / 2)}<span className="text-xs font-normal" style={{ color: MUTED }}> / tuần</span></p>
+          ) : (
+            <p className="text-xs" style={{ color: MUTED }}>{!st.eligible ? `Có sau khi dùng TNTime đủ 2 tuần (còn ${Math.max(1, MIN_USE_DAYS - st.usedDays)} ngày)` : "Tháng này chưa đủ 1 tuần dữ liệu"}</p>
+          )}
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        {st.weeks.map((w) => {
+          const h = w.min / 60;
+          return (
+            <div key={w.ws} className="flex items-center gap-3">
+              <span className="w-24 text-[11px]" style={{ color: MUTED }}>{fmtDM(w.from)} – {fmtDM(w.to)}</span>
+              <div className="relative h-3 flex-1 overflow-hidden rounded-full" style={{ backgroundColor: "#FBEAF1" }}>
+                <div className="absolute inset-y-0 left-0 rounded-full" style={{ width: `${(w.min / maxW) * 100}%`, backgroundColor: h > OVERWORK_HOURS ? DANGER : PRIMARY, opacity: 0.8 }} />
+              </div>
+              <span className="w-14 text-right text-[11px]" style={{ color: h > OVERWORK_HOURS ? DANGER : INK }}>{formatHours(Math.round(h * 2) / 2)}</span>
+            </div>
+          );
+        })}
+      </div>
+      <p className="mt-2 text-[11px]" style={{ color: MUTED_LIGHT }}>Tính cả khung giờ bận và việc đã sắp xếp (phần trùng chỉ tính 1 lần). Tuần ở đầu/cuối tháng chỉ tính các ngày thuộc tháng này.</p>
+    </div>
+  );
+}
+
+function DashboardView({ busySlots, busyOnce, tasks, onDropTask, user }) {
   const tags = useTags();
   const cal = useCalendarState();
   const [selectedTaskId, setSelectedTaskId] = useState(null);
@@ -1766,6 +1885,8 @@ function DashboardView({ busySlots, busyOnce, tasks, onDropTask }) {
         <StatCard icon={LayoutGrid} label="Tỷ lệ dùng tuần đang xem" value={`${utilization}%`} accent={PURPLE} />
         <StatCard icon={AlertTriangle} label="Chưa sắp xếp" value={unscheduledCount} sub={unscheduledCount ? "vào Trợ lý sắp xếp" : "ổn"} accent={DANGER} />
       </div>
+
+      <MonthlyReport user={user} busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} />
 
       <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
         <p className="mb-3 text-sm font-medium" style={{ color: INK }}>Thời gian rảnh & đã dùng — tuần {fmtDM(cal.dates[0])} – {fmtDM(cal.dates[6])}</p>
@@ -3371,8 +3492,12 @@ function AdminUsers({ notify }) {
     db.collection("users").get().then((snap) => {
       setList(snap.docs.map((d) => {
         const x = d.data() || {};
+        const created = tsToDate(x.createdAt);
+        const now = new Date();
+        const ms = monthBusyStats(normalizeLoadedBusySlots(x.busySlots), normalizeLoadedBusySlots(x.busyOnce), (x.tasks || []).filter((t) => t && t.v === 2), now.getFullYear(), now.getMonth(), created ? dateKey(created) : null);
         return {
-          uid: d.id, email: x.email || "(không có email)", disabled: !!x.disabled,
+          uid: d.id, email: x.email || "(không có email)", name: x.name || "", disabled: !!x.disabled,
+          avgWeek: ms.avgWeekMin == null ? null : ms.avgWeekMin / 60, monthTotal: ms.totalMin / 60,
           createdAt: tsToDate(x.createdAt), lastSeen: tsToDate(x.lastSeen || x.updatedAt),
           nTasks: Array.isArray(x.tasks) ? x.tasks.length : 0, owner: !!x.ownedCenterId, nCenters: (x.centerIds || []).length,
         };
@@ -3405,14 +3530,17 @@ function AdminUsers({ notify }) {
       <div className="overflow-auto rounded-2xl border" style={{ borderColor: BORDER, backgroundColor: CARD }}>
         <table className="w-full text-xs" style={{ color: INK }}>
           <thead style={{ backgroundColor: "#FFF6FA" }}>
-            <tr>{["Email", "Ngày đăng kí", "Hoạt động gần nhất", "Số việc", "Trung tâm", "Trạng thái", ""].map((h) => <th key={h} className="whitespace-nowrap px-3 py-2 text-left font-semibold">{h}</th>)}</tr>
+            <tr>{["Email", "Ngày đăng kí", "Hoạt động gần nhất", `Bận T${new Date().getMonth() + 1}`, "Số việc", "Trung tâm", "Trạng thái", ""].map((h) => <th key={h} className="whitespace-nowrap px-3 py-2 text-left font-semibold">{h}</th>)}</tr>
           </thead>
           <tbody>
             {shown.map((u) => (
               <tr key={u.uid} className="border-t" style={{ borderColor: BORDER, opacity: u.disabled ? 0.65 : 1 }}>
-                <td className="px-3 py-2 font-medium">{u.email}</td>
+                <td className="px-3 py-2 font-medium">{u.email}{u.name && <span className="block text-[10.5px] font-normal" style={{ color: MUTED }}>{u.name}</span>}</td>
                 <td className="whitespace-nowrap px-3 py-2">{u.createdAt ? fmtDT(u.createdAt) : <span style={{ color: MUTED_LIGHT }}>chưa ghi nhận</span>}</td>
                 <td className="whitespace-nowrap px-3 py-2">{fmtDT(u.lastSeen)}</td>
+                <td className="whitespace-nowrap px-3 py-2" title="Tổng giờ bận tháng này · trung bình mỗi tuần (khi đã dùng đủ 2 tuần)">
+                  {Math.round(u.monthTotal)}h{u.avgWeek != null ? <span style={{ color: u.avgWeek > OVERWORK_HOURS ? DANGER : MUTED }}> · TB {Math.round(u.avgWeek)}h/tuần</span> : <span style={{ color: MUTED_LIGHT }}> · chưa đủ 2 tuần</span>}
+                </td>
                 <td className="px-3 py-2">{u.nTasks}</td>
                 <td className="whitespace-nowrap px-3 py-2">{u.owner ? "Chủ TT" : ""}{u.owner && u.nCenters ? " · " : ""}{u.nCenters ? `GV ở ${u.nCenters} TT` : ""}{!u.owner && !u.nCenters ? "—" : ""}</td>
                 <td className="px-3 py-2">{u.disabled ? <span style={{ color: DANGER }}>Đã khoá</span> : <span style={{ color: "#3F9E6B" }}>Hoạt động</span>}</td>
@@ -3660,7 +3788,7 @@ function App() {
     ref.get().then((snap) => {
       if (cancelled) return;
       setLocked(false);
-      const meta = { email: user.email || null, lastSeen: firebase.firestore.FieldValue.serverTimestamp() };
+      const meta = { email: user.email || null, name: user.displayName || null, lastSeen: firebase.firestore.FieldValue.serverTimestamp() };
       const ct = user.metadata && user.metadata.creationTime ? new Date(user.metadata.creationTime) : null;
       if (ct && !isNaN(ct) && !(snap.exists && (snap.data() || {}).createdAt)) meta.createdAt = firebase.firestore.Timestamp.fromDate(ct);
       if (snap.exists && (snap.data() || {}).disabled) { setLocked(true); setDataLoading(false); return; }
@@ -4119,7 +4247,8 @@ function App() {
       <TagsContext.Provider value={tags}>
       <GcalContext.Provider value={gcalCtx}>
       <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
-        {view === "dashboard" && <DashboardView busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onDropTask={handleDropTask} />}
+        <CareBanner key={user.uid} user={user} busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} />
+        {view === "dashboard" && <DashboardView busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onDropTask={handleDropTask} user={user} />}
         {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} tasks={tasks} setTags={setTags} notify={notify} />}
         {view === "center" && (
           <CenterView
