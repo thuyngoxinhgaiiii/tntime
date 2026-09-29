@@ -82,6 +82,10 @@ function makeIcon(children, viewBox = "0 0 24 24") {
 
 const Clock3 = makeIcon(<><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>);
 const Plus = makeIcon(<><path d="M12 5v14" /><path d="M5 12h14" /></>);
+const Upload = makeIcon(<><path d="M12 15V4" /><path d="M7 9l5-5 5 5" /><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" /></>);
+const Download = makeIcon(<><path d="M12 4v11" /><path d="M7 10l5 5 5-5" /><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" /></>);
+const Shield = makeIcon(<><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" /></>);
+const Lock = makeIcon(<><rect x="5" y="11" width="14" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></>);
 const Trash2 = makeIcon(<><path d="M4 7h16" /><path d="M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13" /><path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3" /></>);
 const Sparkles = makeIcon(<><path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z" /><path d="M19 15l.7 1.9L21.5 17.6l-1.8.7L19 20.2l-.7-1.9-1.8-.7 1.8-.7L19 15z" /></>);
 const LayoutGrid = makeIcon(<><rect x="3" y="3" width="8" height="8" rx="1.5" /><rect x="13" y="3" width="8" height="8" rx="1.5" /><rect x="3" y="13" width="8" height="8" rx="1.5" /><rect x="13" y="13" width="8" height="8" rx="1.5" /></>);
@@ -450,7 +454,7 @@ function normalizeLoadedBusySlots(raw) {
   const out = {};
   Object.keys(raw).forEach((d) => {
     out[d] = (raw[d] || [])
-      .map((b) => ({ id: b.id || uid(), s: Number(b.s), e: Number(b.e), note: typeof b.note === "string" ? b.note : "", tag: typeof b.tag === "string" ? b.tag : "", ...(b.g && typeof b.g === "object" ? { g: b.g } : {}) }))
+      .map((b) => ({ id: b.id || uid(), s: Number(b.s), e: Number(b.e), note: typeof b.note === "string" ? b.note : "", tag: typeof b.tag === "string" ? b.tag : "", ...(/^\d{4}-\d{2}-\d{2}$/.test(b.until || "") ? { until: b.until } : {}), ...(b.g && typeof b.g === "object" ? { g: b.g } : {}) }))
       .filter((b) => b.e > b.s);
   });
   return out;
@@ -482,9 +486,16 @@ function formatHours(h) { return formatDuration(Math.round(h * 60)); }
    + khối chỉ diễn ra 1 lần vào đúng ngày đó. */
 function busyForDate(busySlots, busyOnce, dk, di) {
   return [
-    ...(busySlots[di] || []).map((b) => ({ ...b, kind: "weekly" })),
+    ...(busySlots[di] || []).filter((b) => !b.until || dk <= b.until).map((b) => ({ ...b, kind: "weekly" })),
     ...((busyOnce || {})[dk] || []).map((b) => ({ ...b, kind: "once" })),
   ];
+}
+
+/* Chỉ giữ các khối lặp hằng tuần còn hiệu lực tính từ ngày dk */
+function activeWeekly(busySlots, dk) {
+  const out = {};
+  Object.keys(busySlots || {}).forEach((k) => { out[k] = (busySlots[k] || []).filter((b) => !b.until || b.until >= dk); });
+  return out;
 }
 
 function freeMinutesForDate(busySlots, busyOnce, d) {
@@ -504,7 +515,7 @@ function freeMinutesForDate(busySlots, busyOnce, d) {
 function migrateTask(t) {
   if (!t || typeof t !== "object") return null;
   if (t.v === 2) {
-    return { ...t, duration: Number(t.duration) || 1, deadlineMin: Number(t.deadlineMin) || 18 * 60, scheduledStart: t.scheduledStart == null ? null : Number(t.scheduledStart) };
+    return { ...t, startDate: /^\d{4}-\d{2}-\d{2}$/.test(t.startDate || "") ? t.startDate : null, duration: Number(t.duration) || 1, deadlineMin: Number(t.deadlineMin) || 18 * 60, scheduledStart: t.scheduledStart == null ? null : Number(t.scheduledStart) };
   }
   const base = startOfWeek(new Date());
   const out = {
@@ -542,6 +553,7 @@ function placementError(busySlots, busyOnce, tasks, task, dk, s) {
   if (s < DAY_START_MIN || e > DAY_END_MIN) return `Chỉ có thể xếp trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`;
   const tk = todayKey();
   if (dk < tk || (dk === tk && s < nowMinutes())) return "Không thể xếp vào thời điểm đã qua.";
+  if (task.startDate && dk < task.startDate) return `Việc này chỉ bắt đầu từ ${fmtDateLabel(task.startDate)}.`;
   if (dk > task.deadlineDate || (dk === task.deadlineDate && e > task.deadlineMin)) return `Quá hạn chót (${fmtDateLabel(task.deadlineDate)} ${minToHHMM(task.deadlineMin)}).`;
   if (!isSlotFree(busySlots, busyOnce, tasks, dk, s, e, task.id)) return "Trùng lịch — khung giờ này đã bận hoặc có việc khác.";
   return null;
@@ -563,6 +575,7 @@ function autoSchedule(tasks, busySlots, busyOnce) {
     for (let i = 0; i <= PLAN_WINDOW_DAYS && !placed; i++) {
       const dk = dateKey(addDays(today, i));
       if (dk > t.deadlineDate) break;
+      if (t.startDate && dk < t.startDate) continue;
       const minStart = dk === tk ? Math.max(DAY_START_MIN, Math.ceil(nowM / PLAN_STEP_MIN) * PLAN_STEP_MIN) : DAY_START_MIN;
       const maxEnd = dk === t.deadlineDate ? Math.min(DAY_END_MIN, t.deadlineMin) : DAY_END_MIN;
       for (let s = minStart; s + dm <= maxEnd; s += PLAN_STEP_MIN) {
@@ -801,7 +814,7 @@ function buildRRule(lines, days) {
 const blockSummary = (b, tags) => (b.note && b.note.trim()) || (findTag(tags, b.tag) || {}).label || "Bận";
 function blockColor(b, tags) { const t = findTag(tags, b.tag); return t ? nearestGcalColor(t.color) : "4"; }
 function ownBlockSig(kind, key, b, tags) {
-  return strHash([kind === "weekly" ? "w" : "o", key, b.s, b.e, blockSummary(b, tags), blockColor(b, tags)].join("|"));
+  return strHash([kind === "weekly" ? "w" : "o", key, b.s, b.e, blockSummary(b, tags), blockColor(b, tags)].concat(kind === "weekly" && b.until ? [b.until] : []).join("|"));
 }
 function ownTaskSig(t, tags) {
   return strHash(["t", t.scheduledDate, t.scheduledStart, t.scheduledStart + taskMinutes(t), t.name, nearestGcalColor(catOfTask(tags, t.category).solid)].join("|"));
@@ -822,7 +835,7 @@ function ownItemList(st, tz, fresh) {
       kind: "weekly", id: b.id, key: String(di), item: { ...b, g: gOf(b) }, summary, sig: ownBlockSig("weekly", String(di), b, st.tags),
       body: {
         summary, description: "Khung giờ bận (lặp hằng tuần) từ TNTime" + (tagLabel ? ` · ${tagLabel}` : ""),
-        start: gDT(dk, b.s, tz), end: gDT(dk, b.e, tz), recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${WD_CODES[di]}`],
+        start: gDT(dk, b.s, tz), end: gDT(dk, b.e, tz), recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${WD_CODES[di]}` + (b.until ? `;UNTIL=${b.until.replace(/-/g, "")}T235959Z` : "")],
         colorId: blockColor(b, st.tags), extendedProperties: { private: { tntimeId: b.id, tntimeKind: "weekly" } },
       },
     });
@@ -1031,7 +1044,7 @@ async function gcalSyncCore(token, calId, st, fresh) {
         if (!p || (rr.until && rr.until < dateKey(today))) continue;
         masters[ev.id] = ev;
         const days = rr.days.length ? rr.days : [p.di];
-        days.forEach((d) => { desired[`${ev.id}#${d}`] = { kind: "weekly", key: String(d), s: p.s, e: p.e, note: ev.summary || "", upd: ev.updated, gid: ev.id, day: d }; });
+        days.forEach((d) => { desired[`${ev.id}#${d}`] = { kind: "weekly", key: String(d), s: p.s, e: p.e, note: ev.summary || "", upd: ev.updated, gid: ev.id, day: d, until: rr.until || "" }; });
       } else {
         const insts = await glistAll(token, `${prim}/${enc(ev.id)}/instances`, { timeMin, timeMax, showDeleted: false });
         insts.forEach((inst) => {
@@ -1149,7 +1162,7 @@ async function gcalSyncCore(token, calId, st, fresh) {
   for (const k of Object.keys(desired)) {
     if (used.has(k) || localKeys.has(k)) continue;
     const d = desired[k];
-    const b = { id: uid(), s: d.s, e: d.e, note: d.note, tag: "" };
+    const b = { id: uid(), s: d.s, e: d.e, note: d.note, tag: "", ...(d.until ? { until: d.until } : {}) };
     b.g = { src: "import", cal: "primary", id: d.gid, key: k, day: d.kind === "weekly" ? d.day : null, dk: d.kind === "once" ? d.key : null, hash: impSig(d.kind, d.key, b), upd: d.upd };
     ops.push({ t: "addBlock", kind: d.kind, key: d.key, block: b });
     stats.down++;
@@ -1720,7 +1733,7 @@ function DashboardView({ busySlots, busyOnce, tasks, onDropTask }) {
   const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
 
   const weekKeys = cal.dates.map(dateKey);
-  const totalBusyMin = totalBusyMinutes(busySlots);
+  const totalBusyMin = totalBusyMinutes(activeWeekly(busySlots, todayKey()));
   const upcoming = tasks.filter((t) => t.status === "scheduled" && t.scheduledDate >= todayKey());
   const upcomingHours = upcoming.reduce((s, t) => s + t.duration, 0);
   const unscheduledCount = tasks.filter((t) => t.status !== "scheduled").length;
@@ -1817,11 +1830,11 @@ function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks,
     const kind = lastRepeatRef.current ? "weekly" : "once";
     const mk = kind === "weekly" ? di : dk;
     setterOf(kind)((prev) => ({ ...prev, [mk]: [...(prev[mk] || []), { id, s: cs, e: ce, note: "", tag }] }));
-    setEditing({ kind, mk, dk, di, id, s: cs, e: ce, note: "", tag, isDraft: true });
+    setEditing({ kind, mk, dk, di, id, s: cs, e: ce, note: "", tag, until: "", isDraft: true });
   }, [setterOf]);
 
   const handleSelectBlock = useCallback((b, dk, di) => {
-    setEditing({ kind: b.kind, mk: b.kind === "weekly" ? di : dk, dk, di, id: b.id, s: b.s, e: b.e, note: b.note || "", tag: b.tag || "" });
+    setEditing({ kind: b.kind, mk: b.kind === "weekly" ? di : dk, dk, di, id: b.id, s: b.s, e: b.e, note: b.note || "", tag: b.tag || "", until: b.until || "" });
   }, []);
 
   const handleResizeBlock = useCallback((b, dk, di, patch) => {
@@ -1985,7 +1998,7 @@ function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, last
     const old = getBlock ? getBlock(kind, mk, id) : null;
     // Khối đến từ Google đổi kiểu lặp → tách thành khối riêng của web
     if (old && old.g && old.g.src === "import" && gc) gc.trashBlock(kind, old);
-    const block = { id, s: editing.s, e: editing.e, note: editing.note, tag: editing.tag || "" };
+    const block = { id, s: editing.s, e: editing.e, note: editing.note, tag: editing.tag || "", ...(repeat && editing.until ? { until: editing.until } : {}) };
     setMap((prev) => removeBusyBlock(prev, mk, id));
     setterOf(toKind)((prev) => ({ ...prev, [toMk]: [...(prev[toMk] || []), block] }));
     setEditing((prev) => ({ ...prev, kind: toKind, mk: toMk }));
@@ -1996,8 +2009,9 @@ function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, last
       notify(editing.e <= editing.s ? "Giờ kết thúc phải sau giờ bắt đầu." : `Chỉ có thể chọn trong khung ${minToHHMM(DAY_START_MIN)} – ${minToHHMM(DAY_END_MIN)}.`, "error");
       return;
     }
-    setMap((prev) => updateBusyBlock(prev, mk, id, { s: editing.s, e: editing.e, note: editing.note.trim(), tag: editing.tag || "" }));
-    notify(kind === "weekly" ? `Đã lưu — lặp lại mỗi ${DAYS[di].full}.` : `Đã lưu — ngày ${fmtDateLabel(dk)}.`, "success");
+    if (kind === "weekly" && editing.until && editing.until < dk) { notify("Ngày kết thúc lặp phải từ ngày đang chọn trở đi.", "error"); return; }
+    setMap((prev) => updateBusyBlock(prev, mk, id, { s: editing.s, e: editing.e, note: editing.note.trim(), tag: editing.tag || "", until: kind === "weekly" && editing.until ? editing.until : undefined }));
+    notify(kind === "weekly" ? `Đã lưu — lặp lại mỗi ${DAYS[di].full}${editing.until ? ` đến hết ${fmtDM(parseKey(editing.until))}/${editing.until.slice(0, 4)}` : ""}.` : `Đã lưu — ngày ${fmtDateLabel(dk)}.`, "success");
     if (lastTagRef) lastTagRef.current = editing.tag || "";
     if (lastRepeatRef) lastRepeatRef.current = kind === "weekly";
     setEditing(null);
@@ -2073,6 +2087,23 @@ function BusyBlockForm({ editing, setEditing, setterOf, notify, lastTagRef, last
           <button onClick={() => setRepeat(true)} className="rounded-full border px-3 py-1 text-xs font-medium" style={chip(kind === "weekly", tagPalette(PRIMARY))}>Lặp lại mỗi {DAYS[di].full}</button>
           <button onClick={() => setRepeat(false)} className="rounded-full border px-3 py-1 text-xs font-medium" style={chip(kind === "once", tagPalette(PRIMARY))}>Chỉ ngày {fmtDM(parseKey(dk))}</button>
         </div>
+        {kind === "weekly" && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs" style={{ color: MUTED }}>
+            <span>Lặp đến ngày</span>
+            <input
+              type="date"
+              min={dk}
+              value={editing.until || ""}
+              onClick={(e) => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (err) {} }}
+              onChange={(ev) => { const v = ev.target.value; setField({ until: v }); if (!v || v >= dk) setMap((prev) => updateBusyBlock(prev, mk, id, { until: v || undefined })); }}
+              className="cursor-pointer rounded-xl border px-2 py-1 text-xs outline-none"
+              style={{ borderColor: BORDER, color: INK }}
+            />
+            {editing.until
+              ? <button onClick={() => { setField({ until: "" }); setMap((prev) => updateBusyBlock(prev, mk, id, { until: undefined })); }} className="rounded-full border px-2 py-0.5" style={{ borderColor: BORDER, color: MUTED }}>Lặp mãi mãi</button>
+              : <span style={{ color: MUTED_LIGHT }}>(để trống = lặp mãi mãi)</span>}
+          </div>
+        )}
       </div>
 
       <div className="mt-3">
@@ -2201,7 +2232,7 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
   const tags = useTags();
   const tk = todayKey();
   const maxKey = dateKey(addDays(new Date(), PLAN_WINDOW_DAYS));
-  const [form, setForm] = useState(() => ({ name: "", category: "dayhoc", duration: 1.5, deadlineDate: dateKey(addDays(new Date(), 7)), deadlineMin: 18 * 60 }));
+  const [form, setForm] = useState(() => ({ name: "", category: "dayhoc", duration: 1.5, startDate: todayKey(), deadlineDate: dateKey(addDays(new Date(), 7)), deadlineMin: 18 * 60 }));
 
   const deadlineOptions = [];
   for (let m = DAY_START_MIN + PLAN_STEP_MIN; m <= DAY_END_MIN; m += PLAN_STEP_MIN) deadlineOptions.push(m);
@@ -2211,11 +2242,14 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
   const addTask = () => {
     if (!form.name.trim()) { notify("Nhập tên việc cần làm trước đã nhé.", "error"); return; }
     if (!form.deadlineDate || form.deadlineDate < tk || form.deadlineDate > maxKey) { notify(`Hạn chót phải trong khoảng hôm nay đến ${fmtDM(parseKey(maxKey))}.`, "error"); return; }
+    if (!form.startDate || form.startDate < tk) { notify("Ngày bắt đầu không được trước hôm nay.", "error"); return; }
+    if (form.startDate > form.deadlineDate) { notify("Ngày bắt đầu phải trước hoặc trùng hạn chót.", "error"); return; }
     const dm = Math.round(Number(form.duration) * 60);
     if (form.deadlineMin - dm < DAY_START_MIN) { notify("Hạn chót quá sớm so với thời lượng, hãy chọn giờ muộn hơn.", "error"); return; }
     if (form.deadlineDate === tk && form.deadlineMin <= nowMinutes()) { notify("Giờ hạn chót hôm nay đã qua rồi.", "error"); return; }
     setTasks((prev) => [...prev, {
       id: uid(), name: form.name.trim(), category: form.category, duration: Number(form.duration),
+      startDate: form.startDate > tk ? form.startDate : null,
       deadlineDate: form.deadlineDate, deadlineMin: Number(form.deadlineMin),
       status: "pending", scheduledDate: null, scheduledStart: null, v: 2,
     }]);
@@ -2259,12 +2293,25 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
             {DURATION_OPTIONS.map((n) => <option key={n} value={n}>{formatHours(n)}</option>)}
           </select>
         </div>
+        <div>
+          <label className="mb-1 block text-xs" style={{ color: MUTED }}>Bắt đầu từ ngày</label>
+          <input
+            type="date"
+            min={tk}
+            max={form.deadlineDate || maxKey}
+            value={form.startDate}
+            onClick={(e) => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (err) {} }}
+            onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value, deadlineDate: f.deadlineDate && f.deadlineDate < e.target.value ? e.target.value : f.deadlineDate }))}
+            className={inputCls + " cursor-pointer"}
+            style={inputStyle}
+          />
+        </div>
         <div className="grid grid-cols-[1fr_110px] gap-3">
           <div>
             <label className="mb-1 block text-xs" style={{ color: MUTED }}>Hạn chót — ngày</label>
             <input
               type="date"
-              min={tk}
+              min={form.startDate || tk}
               max={maxKey}
               value={form.deadlineDate}
               onClick={(e) => { try { e.currentTarget.showPicker && e.currentTarget.showPicker(); } catch (err) {} }}
@@ -2282,7 +2329,7 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
         </div>
         {form.deadlineDate && (
           <p className="text-[11px]" style={{ color: MUTED }}>
-            Hạn: <b style={{ color: INK }}>{fmtDateLabel(form.deadlineDate)}</b> lúc {minToHHMM(form.deadlineMin)} · {daysLeft <= 0 ? "hôm nay" : `còn ${daysLeft} ngày`} · chọn được tới {fmtDM(parseKey(maxKey))}
+            {form.startDate && form.startDate > tk && <>Từ <b style={{ color: INK }}>{fmtDateLabel(form.startDate)}</b> · </>}Hạn: <b style={{ color: INK }}>{fmtDateLabel(form.deadlineDate)}</b> lúc {minToHHMM(form.deadlineMin)} · {daysLeft <= 0 ? "hôm nay" : `còn ${daysLeft} ngày`} · chọn được tới {fmtDM(parseKey(maxKey))}
           </p>
         )}
         <button onClick={addTask} className="flex w-full items-center justify-center gap-1.5 rounded-full py-2 text-sm font-semibold text-white" style={{ backgroundColor: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>
@@ -2297,7 +2344,7 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
             <Sparkles size={15} /> Sắp xếp thông minh
           </button>
         </div>
-
+        <ExcelImport tasks={tasks} setTasks={setTasks} busySlots={busySlots} busyOnce={busyOnce} notify={notify} />
         {pending.length === 0 ? (
           <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed p-8 text-center" style={{ borderColor: BORDER }}>
             <Flower size={30} petal={PRIMARY} center={SECONDARY} />
@@ -2315,7 +2362,7 @@ function AssistantView({ tasks, setTasks, busySlots, busyOnce, notify }) {
                     <div>
                       <p className="text-sm font-medium" style={{ color: INK }}>{t.name}</p>
                       <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>
-                        {c.label} · {formatHours(t.duration)} · hạn {fmtDateLabel(t.deadlineDate)} {minToHHMM(t.deadlineMin)}
+                        {c.label} · {formatHours(t.duration)}{t.startDate && t.startDate > tk ? ` · từ ${fmtDM(parseKey(t.startDate))}` : ""} · hạn {fmtDateLabel(t.deadlineDate)} {minToHHMM(t.deadlineMin)}
                         {overdue ? <span style={{ color: DANGER }}> · đã quá hạn</span> : t.status === "unscheduled" && <span style={{ color: DANGER }}> · chưa tìm được chỗ trống</span>}
                       </p>
                     </div>
@@ -3021,6 +3068,517 @@ function AuthScreen({ notify }) {
 /*  App shell                                                             */
 /* ---------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------- */
+/*  Tải danh sách việc từ Excel (SheetJS tải khi cần)                     */
+/* ---------------------------------------------------------------------- */
+
+const XLSX_SRC = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+let xlsxPromise = null;
+function loadXLSX() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (!xlsxPromise) {
+    xlsxPromise = new Promise((resolve, reject) => {
+      const sc = document.createElement("script");
+      sc.src = XLSX_SRC;
+      sc.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error("xlsx")));
+      sc.onerror = () => { xlsxPromise = null; reject(new Error("xlsx")); };
+      document.head.appendChild(sc);
+    });
+  }
+  return xlsxPromise;
+}
+
+const stripVN = (x) => String(x == null ? "" : x).normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/đ/gi, "d").toLowerCase().replace(/[^a-z0-9]/g, "");
+const IMPORT_HEADERS = {
+  name: ["tenviec", "tenviecconlam", "ten", "viec", "tenlophoc", "congviec"],
+  category: ["phanloai", "loai", "tag"],
+  duration: ["thoiluong", "thoiluonggio", "sogio"],
+  startDate: ["ngaybatdau", "batdau", "tungay"],
+  deadlineDate: ["deadline", "hanchot", "ngaydeadline", "hanchotngay", "ngayhanchot"],
+  deadlineMin: ["giodeadline", "truocgio", "giohanchot", "hanchotgio"],
+};
+
+function cellToDateKey(v, XLSX) {
+  if (v == null || v === "") return "";
+  if (typeof v === "number") { const d = XLSX.SSF.parse_date_code(v); return d ? `${d.y}-${pad2(d.m)}-${pad2(d.d)}` : null; }
+  const s = String(v).trim();
+  let m = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/.exec(s);
+  if (m) return `${m[1]}-${pad2(+m[2])}-${pad2(+m[3])}`;
+  m = /^(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?$/.exec(s);
+  if (m) { const y = m[3] ? (m[3].length === 2 ? 2000 + +m[3] : +m[3]) : new Date().getFullYear(); return `${y}-${pad2(+m[2])}-${pad2(+m[1])}`; }
+  return null;
+}
+function cellToMinutes(v) {
+  if (v == null || v === "") return "";
+  if (typeof v === "number") return v < 1 ? Math.round(v * 1440) : (v <= 24 ? Math.round(v * 60) : null);
+  const m = /^(\d{1,2})\s*(?:[:hg]\s*(\d{1,2})?)?\s*(?:p|phut)?$/i.exec(String(v).trim());
+  return m ? +m[1] * 60 + (+m[2] || 0) : null;
+}
+function cellToHours(v) {
+  if (v == null || v === "") return null;
+  if (typeof v === "number") return v;
+  const s = stripVN(String(v).replace(",", ".").replace(/\s/g, "").replace(/(\d)\.(\d)/, "$1d$2"));
+  let m = /^(\d+)d(\d+)(?:h|g|gio)?$/.exec(s); if (m) return parseFloat(`${m[1]}.${m[2]}`);
+  m = /^(\d+)(?:h|g|gio)(\d+)?(?:p|phut)?$/.exec(s); if (m) return +m[1] + (+m[2] || 0) / 60;
+  m = /^(\d+)(?:p|phut)$/.exec(s); if (m) return +m[1] / 60;
+  m = /^(\d+)$/.exec(s); if (m) return +m[1];
+  return null;
+}
+
+/* Chuyển 1 dòng Excel → việc cần làm (hoặc danh sách lỗi) */
+function rowToTask(row, tags, XLSX) {
+  const errs = [];
+  const tk = todayKey();
+  const maxKey = dateKey(addDays(new Date(), PLAN_WINDOW_DAYS));
+  const name = String(row.name == null ? "" : row.name).trim();
+  if (!name) errs.push("thiếu tên việc");
+  const catRaw = stripVN(row.category);
+  const cat = tags.find((t) => stripVN(t.label) === catRaw || t.id === String(row.category || "").trim()) || tags.find((t) => t.id === "khac") || tags[0];
+  let dur = cellToHours(row.duration);
+  if (dur == null || !(dur > 0)) { errs.push("thời lượng không hợp lệ"); dur = 1; }
+  dur = Math.min(8, Math.max(0.5, Math.round(dur * 2) / 2));
+  let start = cellToDateKey(row.startDate, XLSX);
+  if (start === null) errs.push("ngày bắt đầu sai định dạng");
+  if (!start || start < tk) start = tk;
+  const dl = cellToDateKey(row.deadlineDate, XLSX);
+  if (!dl) errs.push(dl === "" ? "thiếu deadline" : "deadline sai định dạng");
+  else if (dl < tk || dl > maxKey) errs.push(`deadline phải từ hôm nay đến ${fmtDM(parseKey(maxKey))}`);
+  else if (start > dl) errs.push("ngày bắt đầu sau deadline");
+  let dm = cellToMinutes(row.deadlineMin);
+  if (dm === null) { errs.push("giờ deadline sai định dạng"); dm = 18 * 60; }
+  if (dm === "") dm = 18 * 60;
+  dm = Math.min(DAY_END_MIN, Math.max(DAY_START_MIN + PLAN_STEP_MIN, Math.round(dm / PLAN_STEP_MIN) * PLAN_STEP_MIN));
+  if (dm - dur * 60 < DAY_START_MIN) errs.push("giờ deadline quá sớm so với thời lượng");
+  if (dl === tk && dm <= nowMinutes()) errs.push("giờ deadline hôm nay đã qua");
+  const catNote = row.category && stripVN(cat.label) !== catRaw ? `không có phân loại "${row.category}" → dùng "${cat.label}"` : "";
+  return {
+    errs, catNote,
+    task: { id: uid(), name, category: cat.id, duration: dur, startDate: start > tk ? start : null, deadlineDate: dl || "", deadlineMin: dm, status: "pending", scheduledDate: null, scheduledStart: null, v: 2 },
+  };
+}
+
+function ExcelImport({ tasks, setTasks, busySlots, busyOnce, notify }) {
+  const tags = useTags();
+  const [busy, setBusy] = useState(false);
+  const [rows, setRows] = useState(null); // [{ errs, catNote, task }]
+  const [autoRun, setAutoRun] = useState(true);
+  const fileRef = useRef(null);
+
+  const downloadTemplate = async () => {
+    try {
+      setBusy(true);
+      const XLSX = await loadXLSX();
+      const d1 = addDays(new Date(), 1), d2 = addDays(new Date(), 6);
+      const aoa = [
+        ["Tên việc", "Phân loại", "Thời lượng (giờ)", "Ngày bắt đầu", "Deadline", "Giờ deadline"],
+        ["Soạn giáo án HSK3", tags[0] ? tags[0].label : "Dạy học", 1.5, fmtDM(d1) + "/" + d1.getFullYear(), fmtDM(d2) + "/" + d2.getFullYear(), "18:00"],
+        ["Chấm bài kiểm tra", "Hoạt động khác", 2, "", fmtDM(d2) + "/" + d2.getFullYear(), "21:00"],
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = [{ wch: 28 }, { wch: 16 }, { wch: 16 }, { wch: 14 }, { wch: 14 }, { wch: 13 }];
+      const ws2 = XLSX.utils.aoa_to_sheet([
+        ["Hướng dẫn"],
+        ["• Mỗi dòng là 1 việc. Chỉ bắt buộc: Tên việc, Thời lượng, Deadline."],
+        ["• Phân loại: " + tags.map((t) => t.label).join(", ") + " (sai tên → dùng Hoạt động khác)."],
+        ["• Thời lượng: số giờ, bước 0,5 (VD 1.5 hoặc 1h30), tối đa 8 giờ."],
+        ["• Ngày: dd/mm/yyyy. Để trống Ngày bắt đầu = bắt đầu từ hôm nay."],
+        [`• Deadline trong vòng ${PLAN_WINDOW_DAYS} ngày tới. Giờ deadline dạng 18:00 (để trống = 18:00).`],
+      ]);
+      ws2["!cols"] = [{ wch: 90 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Viec can lam");
+      XLSX.utils.book_append_sheet(wb, ws2, "Huong dan");
+      XLSX.writeFile(wb, "TNTime-mau-viec-can-lam.xlsx");
+    } catch (e) {
+      notify("Không tải được thư viện Excel, kiểm tra kết nối mạng.", "error");
+    } finally { setBusy(false); }
+  };
+
+  const onFile = async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    try {
+      setBusy(true);
+      const XLSX = await loadXLSX();
+      const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true });
+      const hi = aoa.findIndex((r) => r.some((c) => IMPORT_HEADERS.name.includes(stripVN(c))));
+      if (hi < 0) { notify('Không tìm thấy cột "Tên việc". Hãy dùng file mẫu nhé.', "error"); return; }
+      const colOf = {};
+      [true, false].forEach((exact) => aoa[hi].forEach((c, i) => {
+        const h = stripVN(c);
+        if (Object.values(colOf).includes(i)) return;
+        Object.keys(IMPORT_HEADERS).forEach((k) => { if (colOf[k] == null && !Object.values(colOf).includes(i) && IMPORT_HEADERS[k].some((x) => h === x || (!exact && x.length > 4 && h.startsWith(x)))) colOf[k] = i; });
+      }));
+      const out = aoa.slice(hi + 1)
+        .filter((r) => r.some((c) => String(c).trim() !== ""))
+        .map((r) => {
+          const row = {}; Object.keys(colOf).forEach((k) => { row[k] = r[colOf[k]]; });
+          return rowToTask(row, tags, XLSX);
+        });
+      if (!out.length) { notify("File không có dòng việc nào.", "error"); return; }
+      setRows(out);
+    } catch (e) {
+      notify("Không đọc được file. Hãy chọn file .xlsx, .xls hoặc .csv.", "error");
+    } finally { setBusy(false); }
+  };
+
+  const okRows = rows ? rows.filter((r) => !r.errs.length) : [];
+  const confirm = () => {
+    if (!okRows.length) return;
+    const newTasks = okRows.map((r) => r.task);
+    if (autoRun) {
+      const all = [...tasks, ...newTasks];
+      const results = autoSchedule(all, busySlots, busyOnce);
+      setTasks(all.map((t) => (results[t.id] ? { ...t, ...results[t.id] } : t)));
+      const ok = newTasks.filter((t) => results[t.id] && results[t.id].status === "scheduled").length;
+      notify(`Đã thêm ${newTasks.length} việc, sắp xếp được ${ok}${ok < newTasks.length ? `, còn ${newTasks.length - ok} việc chưa tìm được chỗ trống` : ""}.`, ok < newTasks.length ? "error" : "success");
+    } else {
+      setTasks((prev) => [...prev, ...newTasks]);
+      notify(`Đã thêm ${newTasks.length} việc vào danh sách chờ.`, "success");
+    }
+    setRows(null);
+  };
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-dashed p-3" style={{ borderColor: BORDER, backgroundColor: "#FFFFFF" }}>
+        <Download size={15} style={{ color: PRIMARY }} />
+        <span className="text-xs" style={{ color: INK }}>Có nhiều việc? Tải lên danh sách Excel để trợ lý sắp xếp hàng loạt.</span>
+        <div className="ml-auto flex gap-1.5">
+          <button disabled={busy} onClick={downloadTemplate} className="rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>File mẫu</button>
+          <button disabled={busy} onClick={() => fileRef.current && fileRef.current.click()} className="flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-semibold text-white" style={{ backgroundColor: PRIMARY }}>
+            <Upload size={13} /> {busy ? "Đang xử lý..." : "Tải Excel lên"}
+          </button>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" onChange={onFile} className="hidden" />
+        </div>
+      </div>
+
+      {rows && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(74,46,62,0.35)" }} onClick={() => setRows(null)}>
+          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }} onClick={(e) => e.stopPropagation()}>
+            <p className="mb-1 text-sm font-semibold" style={{ color: INK }}>Xem trước danh sách từ Excel</p>
+            <p className="mb-3 text-xs" style={{ color: MUTED }}>
+              {okRows.length} dòng hợp lệ{rows.length - okRows.length ? <span style={{ color: DANGER }}> · {rows.length - okRows.length} dòng lỗi (sẽ bỏ qua — sửa trong Excel rồi tải lại)</span> : ""}
+            </p>
+            <div className="flex-1 overflow-auto rounded-xl border" style={{ borderColor: BORDER }}>
+              <table className="w-full text-xs" style={{ color: INK }}>
+                <thead style={{ backgroundColor: "#FFF6FA" }}>
+                  <tr>{["#", "Tên việc", "Phân loại", "Thời lượng", "Bắt đầu", "Deadline", "Ghi chú"].map((h) => <th key={h} className="whitespace-nowrap px-2 py-1.5 text-left font-semibold">{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, i) => {
+                    const t = r.task, bad = r.errs.length > 0;
+                    return (
+                      <tr key={t.id} className="border-t" style={{ borderColor: BORDER, backgroundColor: bad ? "#FEF2F5" : "transparent" }}>
+                        <td className="px-2 py-1.5" style={{ color: MUTED }}>{i + 1}</td>
+                        <td className="px-2 py-1.5 font-medium">{t.name || "—"}</td>
+                        <td className="px-2 py-1.5">{catOfTask(tags, t.category).label}</td>
+                        <td className="whitespace-nowrap px-2 py-1.5">{formatHours(t.duration)}</td>
+                        <td className="whitespace-nowrap px-2 py-1.5">{t.startDate ? fmtDM(parseKey(t.startDate)) : "hôm nay"}</td>
+                        <td className="whitespace-nowrap px-2 py-1.5">{t.deadlineDate ? `${fmtDM(parseKey(t.deadlineDate))} ${minToHHMM(t.deadlineMin)}` : "—"}</td>
+                        <td className="px-2 py-1.5" style={{ color: bad ? DANGER : MUTED }}>{bad ? r.errs.join("; ") : r.catNote || "✓"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <label className="flex cursor-pointer items-center gap-1.5 text-xs" style={{ color: INK }}>
+                <input type="checkbox" checked={autoRun} onChange={(e) => setAutoRun(e.target.checked)} /> Sắp xếp luôn sau khi thêm
+              </label>
+              <div className="ml-auto flex gap-2">
+                <button onClick={() => setRows(null)} className="rounded-full border px-3 py-2 text-xs font-medium" style={{ borderColor: BORDER, color: "#8A6070" }}>Huỷ</button>
+                <button disabled={!okRows.length} onClick={confirm} className="rounded-full px-4 py-2 text-xs font-semibold text-white" style={{ backgroundColor: okRows.length ? PRIMARY : MUTED_LIGHT }}>
+                  Thêm {okRows.length} việc
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Admin                                                                 */
+/* ---------------------------------------------------------------------- */
+
+const ADMIN_EMAILS = ["thuy34445@gmail.com"];
+const isAdminUser = (u) => !!(u && u.email && u.emailVerified !== false && ADMIN_EMAILS.includes(u.email.toLowerCase()));
+
+/* Ghi nhận lượt truy cập: mỗi phiên trình duyệt +1 lượt xem / ngày;
+   người đã đăng nhập được ghi uid 1 lần / ngày (để đếm số người dùng). */
+function trackVisit(user) {
+  const dk = todayKey();
+  const ref = db.collection("visits").doc(dk);
+  const FV = firebase.firestore.FieldValue;
+  try {
+    if (!sessionStorage.getItem("tn_v_" + dk)) {
+      sessionStorage.setItem("tn_v_" + dk, "1");
+      ref.set({ date: dk, views: FV.increment(1) }, { merge: true }).catch(() => {});
+    }
+  } catch (e) {}
+  if (!user) return;
+  try {
+    const k = `tn_vu_${dk}_${user.uid}`;
+    if (localStorage.getItem(k)) return;
+    localStorage.setItem(k, "1");
+  } catch (e) {}
+  ref.set({ date: dk, uids: FV.arrayUnion(user.uid) }, { merge: true }).catch(() => {});
+}
+
+const tsToDate = (v) => (!v ? null : v.toDate ? v.toDate() : new Date(v));
+function fmtDT(d) { return d && !isNaN(d) ? `${fmtDM(d)}/${d.getFullYear()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}` : "—"; }
+
+function AdminUsers({ notify }) {
+  const [list, setList] = useState(null);
+  const [q, setQ] = useState("");
+  const load = useCallback(() => {
+    db.collection("users").get().then((snap) => {
+      setList(snap.docs.map((d) => {
+        const x = d.data() || {};
+        return {
+          uid: d.id, email: x.email || "(không có email)", disabled: !!x.disabled,
+          createdAt: tsToDate(x.createdAt), lastSeen: tsToDate(x.lastSeen || x.updatedAt),
+          nTasks: Array.isArray(x.tasks) ? x.tasks.length : 0, owner: !!x.ownedCenterId, nCenters: (x.centerIds || []).length,
+        };
+      }).sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0)));
+    }).catch(() => notify("Không tải được danh sách người dùng — kiểm tra Firestore Rules cho admin.", "error"));
+  }, [notify]);
+  useEffect(() => { load(); }, [load]);
+
+  const toggle = async (u) => {
+    if (ADMIN_EMAILS.includes(String(u.email).toLowerCase())) { notify("Không thể khoá tài khoản admin.", "error"); return; }
+    const verb = u.disabled ? "MỞ KHOÁ" : "KHOÁ";
+    if (!window.confirm(`${verb} tài khoản ${u.email}?${u.disabled ? "" : "\nNgười này sẽ không dùng được TNTime cho tới khi được mở khoá (dữ liệu vẫn giữ nguyên)."}`)) return;
+    try {
+      await db.collection("users").doc(u.uid).update({ disabled: !u.disabled, disabledAt: firebase.firestore.FieldValue.serverTimestamp() });
+      setList((p) => p.map((x) => (x.uid === u.uid ? { ...x, disabled: !u.disabled } : x)));
+      notify(`Đã ${u.disabled ? "mở khoá" : "khoá"} ${u.email}.`, "success");
+    } catch (e) { notify("Không thực hiện được — kiểm tra Firestore Rules.", "error"); }
+  };
+
+  if (!list) return <p className="text-sm" style={{ color: MUTED }}>Đang tải...</p>;
+  const shown = list.filter((u) => !q || u.email.toLowerCase().includes(q.toLowerCase()));
+  const today = todayKey();
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Tìm theo email..." className="min-w-[200px] flex-1 rounded-xl border px-3 py-2 text-sm outline-none" style={{ borderColor: BORDER, color: INK }} />
+        <span className="text-xs" style={{ color: MUTED }}>{list.length} tài khoản · {list.filter((u) => u.lastSeen && dateKey(u.lastSeen) === today).length} hoạt động hôm nay · {list.filter((u) => u.disabled).length} bị khoá</span>
+        <button onClick={load} className="rounded-full border px-3 py-1.5 text-xs" style={{ borderColor: BORDER, color: "#8A6070" }}>↻ Tải lại</button>
+      </div>
+      <div className="overflow-auto rounded-2xl border" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <table className="w-full text-xs" style={{ color: INK }}>
+          <thead style={{ backgroundColor: "#FFF6FA" }}>
+            <tr>{["Email", "Ngày đăng kí", "Hoạt động gần nhất", "Số việc", "Trung tâm", "Trạng thái", ""].map((h) => <th key={h} className="whitespace-nowrap px-3 py-2 text-left font-semibold">{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {shown.map((u) => (
+              <tr key={u.uid} className="border-t" style={{ borderColor: BORDER, opacity: u.disabled ? 0.65 : 1 }}>
+                <td className="px-3 py-2 font-medium">{u.email}</td>
+                <td className="whitespace-nowrap px-3 py-2">{u.createdAt ? fmtDT(u.createdAt) : <span style={{ color: MUTED_LIGHT }}>chưa ghi nhận</span>}</td>
+                <td className="whitespace-nowrap px-3 py-2">{fmtDT(u.lastSeen)}</td>
+                <td className="px-3 py-2">{u.nTasks}</td>
+                <td className="whitespace-nowrap px-3 py-2">{u.owner ? "Chủ TT" : ""}{u.owner && u.nCenters ? " · " : ""}{u.nCenters ? `GV ở ${u.nCenters} TT` : ""}{!u.owner && !u.nCenters ? "—" : ""}</td>
+                <td className="px-3 py-2">{u.disabled ? <span style={{ color: DANGER }}>Đã khoá</span> : <span style={{ color: "#3F9E6B" }}>Hoạt động</span>}</td>
+                <td className="px-3 py-2 text-right">
+                  <button onClick={() => toggle(u)} className="whitespace-nowrap rounded-full border px-3 py-1 text-[11px] font-medium" style={{ borderColor: u.disabled ? BORDER : "#F5C6C6", color: u.disabled ? "#3F9E6B" : DANGER }}>
+                    {u.disabled ? "Mở khoá" : "Khoá"}
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>Ngày đăng kí được ghi nhận khi người dùng đăng nhập lần tiếp theo sau bản cập nhật này.</p>
+    </div>
+  );
+}
+
+function AdminCenterCard({ c, onDeleted, notify }) {
+  const [open, setOpen] = useState(false);
+  const [members, setMembers] = useState(null);
+  const [invites, setInvites] = useState([]);
+  const ref = db.collection("centers").doc(c.id);
+  const load = useCallback(() => {
+    ref.collection("members").get().then((s) => setMembers(s.docs.map((d) => ({ uid: d.id, ...d.data() })))).catch(() => setMembers([]));
+    ref.collection("invites").get().then((s) => setInvites(s.docs.map((d) => ({ id: d.id, ...d.data() })))).catch(() => {});
+  }, [c.id]);
+  useEffect(() => { if (open && !members) load(); }, [open, members, load]);
+
+  const removeMember = async (m) => {
+    if (!window.confirm(`Xoá giáo viên ${m.email || m.uid} khỏi trung tâm "${c.name}"?`)) return;
+    try {
+      await ref.collection("members").doc(m.uid).delete();
+      const as = await ref.collection("assignments").where("teacherUid", "==", m.uid).get();
+      await Promise.all(as.docs.map((d) => d.ref.delete()));
+      setMembers((p) => p.filter((x) => x.uid !== m.uid));
+      notify("Đã xoá giáo viên khỏi trung tâm.", "success");
+    } catch (e) { notify("Không xoá được — kiểm tra Firestore Rules.", "error"); }
+  };
+  const removeInvite = async (inv) => {
+    try { await ref.collection("invites").doc(inv.id).delete(); setInvites((p) => p.filter((x) => x.id !== inv.id)); } catch (e) { notify("Không huỷ được lời mời.", "error"); }
+  };
+  const deleteCenter = async () => {
+    if (!window.confirm(`XOÁ trung tâm "${c.name}" (chủ: ${c.ownerEmail || c.ownerId})?\nToàn bộ giáo viên, lời mời và lịch phân lớp của trung tâm sẽ bị xoá. Không thể hoàn tác.`)) return;
+    try {
+      for (const sub of ["members", "invites", "assignments"]) {
+        const s = await ref.collection(sub).get();
+        await Promise.all(s.docs.map((d) => d.ref.delete()));
+      }
+      await ref.delete();
+      notify("Đã xoá trung tâm.", "success");
+      onDeleted(c.id);
+    } catch (e) { notify("Không xoá được trung tâm — kiểm tra Firestore Rules.", "error"); }
+  };
+
+  return (
+    <div className="rounded-2xl border p-3" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Users2 size={15} style={{ color: PRIMARY }} />
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold" style={{ color: INK }}>{c.name || "(chưa đặt tên)"}</p>
+          <p className="text-[11px]" style={{ color: MUTED }}>Chủ: {c.ownerEmail || c.ownerId} · tạo {fmtDT(tsToDate(c.createdAt))}</p>
+        </div>
+        <button onClick={() => setOpen((o) => !o)} className="rounded-full border px-3 py-1 text-xs" style={{ borderColor: BORDER, color: "#8A6070" }}>{open ? "Thu gọn" : "Xem giáo viên"}</button>
+        <button onClick={deleteCenter} className="rounded-full border px-3 py-1 text-xs" style={{ borderColor: "#F5C6C6", color: DANGER }}>Xoá TT</button>
+      </div>
+      {open && (
+        <div className="mt-3 space-y-1.5 border-t pt-3" style={{ borderColor: BORDER }}>
+          {!members ? <p className="text-xs" style={{ color: MUTED }}>Đang tải...</p> : members.length === 0 ? <p className="text-xs" style={{ color: MUTED }}>Chưa có giáo viên nào.</p> : members.map((m) => (
+            <div key={m.uid} className="flex items-center gap-2 text-xs" style={{ color: INK }}>
+              <span className="flex-1">{m.email || m.uid}</span>
+              <span style={{ color: MUTED }}>{Math.round(totalBusyMinutes(m.busySlots || {}) / 60)} giờ bận/tuần · cập nhật {fmtDT(tsToDate(m.updatedAt))}</span>
+              <button onClick={() => removeMember(m)} className="rounded p-1 hover:bg-black/5" style={{ color: DANGER }} title="Xoá khỏi trung tâm"><Trash2 size={13} /></button>
+            </div>
+          ))}
+          {invites.length > 0 && <p className="pt-1 text-[11px] font-semibold" style={{ color: MUTED }}>Lời mời đang chờ</p>}
+          {invites.map((inv) => (
+            <div key={inv.id} className="flex items-center gap-2 text-xs" style={{ color: MUTED }}>
+              <Mail size={12} /><span className="flex-1">{inv.email || inv.id}</span>
+              <button onClick={() => removeInvite(inv)} className="rounded-full border px-2 py-0.5 text-[11px]" style={{ borderColor: BORDER }}>Huỷ</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminCenters({ notify }) {
+  const [list, setList] = useState(null);
+  useEffect(() => {
+    db.collection("centers").get()
+      .then((s) => setList(s.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")))))
+      .catch(() => { setList([]); notify("Không tải được danh sách trung tâm — kiểm tra Firestore Rules cho admin.", "error"); });
+  }, [notify]);
+  if (!list) return <p className="text-sm" style={{ color: MUTED }}>Đang tải...</p>;
+  if (!list.length) return <p className="text-sm" style={{ color: MUTED }}>Chưa có trung tâm nào.</p>;
+  return (
+    <div className="space-y-2">
+      <p className="text-xs" style={{ color: MUTED }}>{list.length} trung tâm</p>
+      {list.map((c) => <AdminCenterCard key={c.id} c={c} notify={notify} onDeleted={(id) => setList((p) => p.filter((x) => x.id !== id))} />)}
+    </div>
+  );
+}
+
+function AdminVisits({ notify }) {
+  const [docs, setDocs] = useState(null);
+  const [mode, setMode] = useState("day");
+  useEffect(() => {
+    const from = dateKey(addDays(new Date(), -370));
+    db.collection("visits").where("date", ">=", from).get()
+      .then((s) => setDocs(s.docs.map((d) => d.data())))
+      .catch(() => { setDocs([]); notify("Không tải được thống kê truy cập — kiểm tra Firestore Rules cho admin.", "error"); });
+  }, [notify]);
+  if (!docs) return <p className="text-sm" style={{ color: MUTED }}>Đang tải...</p>;
+
+  const byDay = {}; docs.forEach((d) => { if (d.date) byDay[d.date] = d; });
+  const now = startOfDay(new Date());
+  const buckets = [];
+  if (mode === "day") {
+    for (let i = 13; i >= 0; i--) { const d = addDays(now, -i); buckets.push({ label: fmtDM(d), from: d, to: d }); }
+  } else if (mode === "week") {
+    const w0 = startOfWeek(now);
+    for (let i = 11; i >= 0; i--) { const a = addDays(w0, -7 * i); buckets.push({ label: fmtDM(a), from: a, to: addDays(a, 6) }); }
+  } else {
+    for (let i = 11; i >= 0; i--) { const a = new Date(now.getFullYear(), now.getMonth() - i, 1); buckets.push({ label: `${pad2(a.getMonth() + 1)}/${String(a.getFullYear()).slice(2)}`, from: a, to: new Date(a.getFullYear(), a.getMonth() + 1, 0) }); }
+  }
+  buckets.forEach((b) => {
+    let views = 0; const us = new Set();
+    for (let d = b.from; d <= b.to; d = addDays(d, 1)) { const x = byDay[dateKey(d)]; if (x) { views += Number(x.views) || 0; (x.uids || []).forEach((u) => us.add(u)); } }
+    b.views = views; b.users = us.size;
+  });
+  const max = Math.max(1, ...buckets.map((b) => b.views));
+  const cur = buckets[buckets.length - 1];
+  const unit = { day: "Hôm nay", week: "Tuần này", month: "Tháng này" }[mode];
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        {[["day", "Theo ngày"], ["week", "Theo tuần"], ["month", "Theo tháng"]].map(([k, l]) => (
+          <button key={k} onClick={() => setMode(k)} className="rounded-full border px-3 py-1 text-xs font-medium" style={{ borderColor: mode === k ? PRIMARY : BORDER, backgroundColor: mode === k ? "#FDEDF4" : "#FFFFFF", color: mode === k ? PRIMARY : "#8A6070" }}>{l}</button>
+        ))}
+        <span className="ml-auto text-xs" style={{ color: MUTED }}>{unit}: <b style={{ color: INK }}>{cur.views}</b> lượt truy cập · <b style={{ color: INK }}>{cur.users}</b> người dùng đăng nhập</span>
+      </div>
+      <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <div className="flex h-48 items-end gap-1.5">
+          {buckets.map((b) => (
+            <div key={b.label} className="flex h-full flex-1 flex-col items-center justify-end gap-1" title={`${b.label}: ${b.views} lượt truy cập, ${b.users} người dùng`}>
+              <span className="text-[10px] font-semibold" style={{ color: b.views ? INK : MUTED_LIGHT }}>{b.views}</span>
+              <div className="w-full rounded-t-md" style={{ height: `${(b.views / max) * 80}%`, minHeight: b.views ? 3 : 1, backgroundColor: b === cur ? PRIMARY : "#F7B3CC" }} />
+            </div>
+          ))}
+        </div>
+        <div className="mt-1 flex gap-1.5 border-t pt-1" style={{ borderColor: BORDER }}>
+          {buckets.map((b) => <span key={b.label} className="flex-1 text-center text-[9.5px]" style={{ color: MUTED }}>{b.label}</span>)}
+        </div>
+      </div>
+      <p className="text-[11px]" style={{ color: MUTED_LIGHT }}>Lượt truy cập = số phiên mở web mỗi ngày (kể cả chưa đăng nhập). Người dùng = số tài khoản khác nhau đã đăng nhập. Bắt đầu đếm từ bản cập nhật này.</p>
+    </div>
+  );
+}
+
+function AdminView({ notify }) {
+  const [tab, setTab] = useState("users");
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Shield size={16} style={{ color: PRIMARY }} />
+        <p className="text-sm font-semibold" style={{ color: INK }}>Quản trị TNTime</p>
+        <div className="ml-auto flex gap-1 rounded-full border p-1" style={{ borderColor: BORDER, backgroundColor: "#FFFFFF" }}>
+          {[["users", "Người dùng"], ["centers", "Trung tâm"], ["visits", "Lượt truy cập"]].map(([k, l]) => (
+            <button key={k} onClick={() => setTab(k)} className="rounded-full px-3 py-1 text-xs font-semibold" style={{ backgroundColor: tab === k ? PRIMARY : "transparent", color: tab === k ? "#FFFFFF" : "#8A6070" }}>{l}</button>
+          ))}
+        </div>
+      </div>
+      {tab === "users" && <AdminUsers notify={notify} />}
+      {tab === "centers" && <AdminCenters notify={notify} />}
+      {tab === "visits" && <AdminVisits notify={notify} />}
+    </div>
+  );
+}
+
+function LockedScreen({ email, onLogout }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center p-6" style={{ backgroundColor: "#FFF6FA" }}>
+      <div className="max-w-sm space-y-3 rounded-2xl border p-6 text-center" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+        <Lock size={30} style={{ color: DANGER, margin: "0 auto" }} />
+        <p className="text-base font-semibold" style={{ color: INK }}>Tài khoản đã bị khoá</p>
+        <p className="text-sm" style={{ color: MUTED }}>Tài khoản {email} tạm thời không thể sử dụng TNTime. Vui lòng liên hệ quản trị viên để được mở khoá. Dữ liệu của bạn vẫn được giữ nguyên.</p>
+        <button onClick={onLogout} className="rounded-full px-4 py-2 text-sm font-semibold text-white" style={{ backgroundColor: PRIMARY }}>Đăng xuất</button>
+      </div>
+    </div>
+  );
+}
+
 const TABS = [
   { id: "dashboard", label: "Tổng quan", icon: LayoutGrid },
   { id: "slots", label: "Khung giờ bận", icon: Clock3 },
@@ -3045,6 +3603,7 @@ function App() {
   const [centerIds, setCenterIds] = useState([]);
   const [ownedCenterId, setOwnedCenterId] = useState(null);
   const [dataLoading, setDataLoading] = useState(true);
+  const [locked, setLocked] = useState(false);
   const [toast, setToast] = useState(null);
   const [justSaved, setJustSaved] = useState(false);
   const skipNextSave = useRef(false);
@@ -3056,7 +3615,7 @@ function App() {
 
   /* Theo dõi trạng thái đăng nhập */
   useEffect(() => {
-    const unsub = auth.onAuthStateChanged((u) => setUser(u));
+    const unsub = auth.onAuthStateChanged((u) => { setUser(u); trackVisit(u); });
     return () => unsub();
   }, []);
 
@@ -3071,6 +3630,12 @@ function App() {
     const ref = db.collection("users").doc(user.uid);
     ref.get().then((snap) => {
       if (cancelled) return;
+      setLocked(false);
+      const meta = { email: user.email || null, lastSeen: firebase.firestore.FieldValue.serverTimestamp() };
+      const ct = user.metadata && user.metadata.creationTime ? new Date(user.metadata.creationTime) : null;
+      if (ct && !isNaN(ct) && !(snap.exists && (snap.data() || {}).createdAt)) meta.createdAt = firebase.firestore.Timestamp.fromDate(ct);
+      if (snap.exists && (snap.data() || {}).disabled) { setLocked(true); setDataLoading(false); return; }
+      if (snap.exists) ref.set(meta, { merge: true }).catch(() => {});
       if (snap.exists) {
         const data = snap.data() || {};
         setCenterIds(Array.isArray(data.centerIds) ? data.centerIds : []);
@@ -3108,6 +3673,7 @@ function App() {
         ref.set({
           busySlots: initBusy,
           tasks: initTasks,
+          ...meta,
           email: user.email || null,
           updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
         }).catch(() => {});
@@ -3130,7 +3696,7 @@ function App() {
   /* Lưu lên Firestore mỗi khi dữ liệu thay đổi (gộp các thay đổi liên tiếp
      trong ~600ms để tránh ghi quá nhiều lần). */
   useEffect(() => {
-    if (!user || dataLoading) return;
+    if (!user || dataLoading || locked) return;
     if (skipNextSave.current) { skipNextSave.current = false; return; }
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
@@ -3146,7 +3712,7 @@ function App() {
       }).catch(() => notify("Lưu dữ liệu thất bại, kiểm tra kết nối mạng.", "error"));
     }, 600);
     return () => clearTimeout(saveTimer.current);
-  }, [busySlots, busyOnce, tasks, tags, gcal, gcalTrash, user, dataLoading]);
+  }, [busySlots, busyOnce, tasks, tags, gcal, gcalTrash, user, dataLoading, locked]);
 
   /* ---------------- Google Calendar: điều phối đồng bộ ---------------- */
   const gcalRef = useRef({ token: null, syncing: false, again: false, autoRuns: [], prompted: false, requesting: false });
@@ -3419,10 +3985,14 @@ function App() {
     if (!user || dataLoading || centerIds.length === 0) return;
     const t = setTimeout(() => {
       centerIds.forEach((cid) => {
-        db.collection("centers").doc(cid).collection("members").doc(user.uid).set({
+        const cref = db.collection("centers").doc(cid);
+        Promise.all([cref.get(), cref.collection("members").doc(user.uid).get()]).then(([c, m]) => {
+          if (!c.exists || !m.exists) return; // trung tâm đã xoá hoặc đã bị gỡ khỏi trung tâm
+          return cref.collection("members").doc(user.uid).set({
           busySlots: clean(busySlots), email: user.email || null, role: "teacher", status: "active",
           updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true }).catch(() => {});
+        }, { merge: true });
+        }).catch(() => {});
       });
     }, 600);
     return () => clearTimeout(t);
@@ -3466,6 +4036,8 @@ function App() {
   if (user === undefined) return <LoadingScreen label="Đang kiểm tra đăng nhập..." />;
   if (user === null) return <AuthScreen notify={notify} />;
   if (dataLoading) return <LoadingScreen label="Đang tải dữ liệu của bạn..." />;
+  if (locked) return <LockedScreen email={user.email} onLogout={() => auth.signOut()} />;
+  const tabs = isAdminUser(user) ? [...TABS, { id: "admin", label: "Admin", icon: Shield }] : TABS;
 
   return (
     <div className="relative min-h-screen w-full" style={{ backgroundColor: "#FFF6FA", fontFamily: "'Inter', system-ui, sans-serif" }}>
@@ -3493,7 +4065,7 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             <nav className="flex gap-1 rounded-full border p-1" style={{ borderColor: BORDER, backgroundColor: "#FFFFFF" }}>
-              {TABS.map((t) => {
+              {tabs.map((t) => {
                 const active = view === t.id;
                 const Icon = t.icon;
                 return (
@@ -3530,6 +4102,7 @@ function App() {
             notify={notify}
           />
         )}
+        {view === "admin" && isAdminUser(user) && <AdminView notify={notify} />}
         {view === "assistant" && <AssistantView tasks={tasks} setTasks={setTasks} busySlots={busySlots} busyOnce={busyOnce} notify={notify} />}
       </main>
       </GcalContext.Provider>
