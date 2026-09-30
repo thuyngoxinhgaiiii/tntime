@@ -871,6 +871,21 @@ function ownBlockSig(kind, key, b, tags) {
 function ownTaskSig(t, tags) {
   return strHash(["t", t.scheduledDate, t.scheduledStart, t.scheduledStart + taskMinutes(t), t.name, nearestGcalColor(catOfTask(tags, t.category).solid)].join("|"));
 }
+/* Nhắc hạn chót: 1 sự kiện "⏰ Hạn chót" trong lịch TNTime, điện thoại báo trước 60 phút */
+const REMIND_MIN = 60;
+const dlSig = (t) => strHash(["dl", t.deadlineDate, t.deadlineMin, t.name, REMIND_MIN].join("|"));
+function deadlineEvBody(t, tz) {
+  return {
+    summary: "⏰ Hạn chót: " + t.name,
+    description: `Nhắc hạn chót từ TNTime · điện thoại sẽ báo trước ${REMIND_MIN} phút` + (t.status === "scheduled" && t.scheduledDate ? ` · đã xếp lịch ${fmtDateLabel(t.scheduledDate)} ${minToHHMM(t.scheduledStart)}` : " · chưa xếp lịch"),
+    start: gDT(t.deadlineDate, t.deadlineMin, tz), end: gDT(t.deadlineDate, t.deadlineMin + 15, tz),
+    transparency: "transparent", colorId: "11",
+    reminders: { useDefault: false, overrides: [{ method: "popup", minutes: REMIND_MIN }] },
+    extendedProperties: { private: { tntimeId: "dl_" + t.id, tntimeKind: "deadline", tntimeSig: dlSig(t) } },
+  };
+}
+const deadlineMs = (t) => { const d = parseKey(t.deadlineDate); d.setMinutes(Number(t.deadlineMin) || 0); return d.getTime(); };
+
 const impSig = (kind, key, b) => strHash(["i", kind, key, b.s, b.e, b.note || ""].join("|"));
 
 /* Danh sách khối / việc "của web" cần có trong lịch TNTime trên Google */
@@ -968,7 +983,7 @@ async function gcalRecoverCore(token, calId, st) {
   for (const ev of evs) {
     const pp = ev.extendedProperties && ev.extendedProperties.private;
     const tid = pp && pp.tntimeId, kind = pp && pp.tntimeKind;
-    if (!tid || seen.has(tid)) continue;
+    if (!tid || seen.has(tid) || kind === "deadline") continue;
     const p = parseEvTime(ev);
     if (!p) continue;
     seen.add(tid);
@@ -1012,6 +1027,35 @@ async function gcalSyncCore(token, calId, st, fresh) {
     if (byTid[tid]) { await gdel(token, `${calPath}/${enc(ev.id)}`); stats.up++; continue; }
     byTid[tid] = ev;
   }
+  /* ---- 1b. Nhắc hạn chót (tự tạo / sửa / xoá, không cần hỏi vì chỉ là lời nhắc) ---- */
+  const remindOn = !!(st.gcal && st.gcal.remind !== false);
+  const dlEvs = {};
+  Object.keys(byTid).forEach((tid) => { if (byTid[tid].extendedProperties.private.tntimeKind === "deadline") { dlEvs[tid] = byTid[tid]; delete byTid[tid]; } });
+  const nowMs = Date.now();
+  for (const t of st.tasks || []) {
+    if (!t.deadlineDate) continue;
+    const eid = "dl_" + t.id, ev = dlEvs[eid];
+    delete dlEvs[eid];
+    if (!remindOn) {
+      if (ev) { await gdel(token, `${calPath}/${enc(ev.id)}`); stats.up++; }
+      if (t.gdl) ops.push({ t: "task", id: t.id, fields: { gdl: null } });
+      continue;
+    }
+    const sig = dlSig(t);
+    if (deadlineMs(t) <= nowMs) continue; // đã qua hạn: giữ nguyên, không tạo mới
+    if (ev) {
+      if (ev.extendedProperties.private.tntimeSig !== sig) { await gapi(token, "PATCH", `${calPath}/${enc(ev.id)}`, { body: deadlineEvBody(t, tz) }); stats.up++; }
+      if (t.gdl !== sig) ops.push({ t: "task", id: t.id, fields: { gdl: sig } });
+      continue;
+    }
+    if (!fresh && t.gdl === sig) continue; // người dùng đã tự xoá lời nhắc trên Google → tôn trọng
+    await gapi(token, "POST", calPath, { body: deadlineEvBody(t, tz) });
+    ops.push({ t: "task", id: t.id, fields: { gdl: sig } });
+    stats.up++;
+  }
+  // Lời nhắc của việc đã xoá khỏi web → xoá luôn
+  for (const tid of Object.keys(dlEvs)) { await gdel(token, `${calPath}/${enc(dlEvs[tid].id)}`); stats.up++; }
+
   const ownItems = ownItemList(st, tz, fresh);
   for (const it of ownItems) {
     const ev = byTid[it.id];
@@ -1254,6 +1298,33 @@ function GcalChip() {
   );
 }
 
+function RemindToggle({ compact }) {
+  const gc = useGcal();
+  if (!gc) return null;
+  const on = gc.enabled && gc.remind;
+  return (
+    <div className={(compact ? "" : "mt-3 border-t pt-3 ") + "flex items-center justify-between gap-3"} style={{ borderColor: BORDER }}>
+      <div className="min-w-0">
+        <p className="flex items-center gap-1.5 text-[13px] font-medium" style={{ color: INK }}>🔔 Nhắc hạn chót trên điện thoại</p>
+        <p className="mt-0.5 text-[11px] leading-relaxed" style={{ color: MUTED }}>
+          {gc.enabled
+            ? (on ? "Mỗi việc có hạn chót sẽ có sự kiện “⏰ Hạn chót” trong lịch TNTime, app Lịch trên điện thoại báo trước 1 tiếng." : "Đang tắt — sẽ không có thông báo hạn chót.")
+            : "Cần kết nối Google Calendar trước để bật nhắc nhở."}
+        </p>
+      </div>
+      <button
+        data-gcal-btn role="switch" aria-checked={on} disabled={!gc.enabled}
+        onClick={() => gc.setRemind(!gc.remind)}
+        title={on ? "Tắt nhắc hạn chót" : "Bật nhắc hạn chót"}
+        className="relative shrink-0 rounded-full transition-colors disabled:opacity-50"
+        style={{ width: 44, height: 24, backgroundColor: on ? PRIMARY : "#D9D4D6" }}
+      >
+        <span className="absolute rounded-full bg-white shadow transition-all" style={{ top: 3, left: on ? 23 : 3, width: 18, height: 18 }} />
+      </button>
+    </div>
+  );
+}
+
 function GcalCard() {
   const gc = useGcal();
   if (!gc) return null;
@@ -1286,6 +1357,7 @@ function GcalCard() {
           )}
         </div>
       </div>
+      <RemindToggle />
       {!gc.configured && <p className="mt-2 text-[11px]" style={{ color: DANGER }}>Tính năng đang chờ quản trị viên cấu hình Google Cloud.</p>}
       {!gc.enabled && gc.configured && st.state === "error" && <p className="mt-2 text-[11px]" style={{ color: DANGER }}>{st.msg}</p>}
       <details className="mt-3 text-[11px]" style={{ color: MUTED }}>
@@ -1295,6 +1367,7 @@ function GcalCard() {
           <li><b>Mac:</b> mở app Lịch → Cài đặt → Tài khoản → dấu + → Google.</li>
           <li><b>Android:</b> app Google Calendar có sẵn — lịch “TNTime” tự hiện.</li>
           <li>Sự kiện muốn đưa vào web: tạo trong lịch <b>chính</b> của tài khoản Google (không phải lịch “TNTime”). Sự kiện cả ngày hoặc đặt “Rảnh” sẽ được bỏ qua.</li>
+          <li><b>Nhận thông báo hạn chót:</b> Android — app Google Calendar tự báo. iPhone — Cài đặt → Thông báo → Lịch → bật “Cho phép thông báo”; nếu vẫn không báo, dùng app Google Calendar. Lời nhắc chỉ được cập nhật khi bạn mở web.</li>
           <li>Mỗi lần mở web, Google có thể hiện cửa sổ nhỏ xác nhận ở lần bấm đầu tiên — đó là bước lấy quyền đồng bộ.</li>
         </ul>
       </details>
@@ -3752,7 +3825,7 @@ function App() {
   // Khung giờ bận chỉ diễn ra 1 lần: { "YYYY-MM-DD": [{ id, s, e, note, tag }] }
   const [busyOnce, setBusyOnce] = useState({});
   // Google Calendar: cài đặt kết nối + danh sách khối (nhập từ Google) vừa bị xoá trên web
-  const [gcal, setGcal] = useState({ enabled: false, email: null, calendarId: null });
+  const [gcal, setGcal] = useState({ enabled: false, email: null, calendarId: null, remind: true });
   const [gcalTrash, setGcalTrash] = useState([]);
   const [gcalStatus, setGcalStatus] = useState({ state: "idle" });
   // Trung tâm: centerIds = các trung tâm mình tham gia với vai trò giáo viên;
@@ -3798,7 +3871,7 @@ function App() {
         setCenterIds(Array.isArray(data.centerIds) ? data.centerIds : []);
         setTags(normalizeTags(data.tags));
         setBusyOnce(normalizeLoadedBusySlots(data.busyOnce));
-        setGcal(data.gcal && typeof data.gcal === "object" ? { enabled: !!data.gcal.enabled, email: data.gcal.email || null, calendarId: data.gcal.calendarId || null } : { enabled: false, email: null, calendarId: null });
+        setGcal(data.gcal && typeof data.gcal === "object" ? { enabled: !!data.gcal.enabled, email: data.gcal.email || null, calendarId: data.gcal.calendarId || null, remind: data.gcal.remind !== false } : { enabled: false, email: null, calendarId: null });
         setGcalTrash(Array.isArray(data.gcalTrash) ? data.gcalTrash : []);
         // Việc kiểu cũ (hạn theo "thứ") → chuyển sang ngày thật, lưu lại ngay
         const rawTasks = Array.isArray(data.tasks) ? data.tasks : [];
@@ -3999,7 +4072,7 @@ function App() {
         setTasks((p) => p.map((t) => ({ ...t, g: null })));
         setGcalTrash([]);
       }
-      setGcal({ enabled: true, email: tok.email || null, calendarId: prev.email && tok.email !== prev.email ? null : prev.calendarId || null });
+      setGcal({ enabled: true, email: tok.email || null, calendarId: prev.email && tok.email !== prev.email ? null : prev.calendarId || null, remind: prev.remind !== false });
       notify("Đã kết nối Google Calendar — đang đồng bộ...", "success");
       setTimeout(() => runGcalSync(), 300);
     }).catch((err) => {
@@ -4093,7 +4166,7 @@ function App() {
       runGcalSync();
     }, 4000);
     return () => clearTimeout(t);
-  }, [busySlots, busyOnce, tasks, tags, gcalTrash, gcal.enabled, user, dataLoading, runGcalSync]);
+  }, [busySlots, busyOnce, tasks, tags, gcalTrash, gcal.enabled, gcal.remind, user, dataLoading, runGcalSync]);
   useEffect(() => {
     if (!user || dataLoading || !gcal.enabled) return;
     const iv = setInterval(() => runGcalSync(), 3 * 60 * 1000);
@@ -4132,6 +4205,8 @@ function App() {
     disconnect: gcalDisconnect,
     trashBlock: gcalTrashBlock,
     recover: gcalRecover,
+    remind: gcal.remind !== false,
+    setRemind: (on) => { setGcal((prev) => ({ ...prev, remind: !!on })); notify(on ? "Đã BẬT nhắc hạn chót — điện thoại sẽ báo trước 1 tiếng." : "Đã TẮT nhắc hạn chót — các lời nhắc trên lịch sẽ được gỡ.", "success"); },
   };
 
 
@@ -4164,7 +4239,7 @@ function App() {
     setTasks([]);
     setTags(DEFAULT_TAGS);
     setBusyOnce({});
-    setGcal({ enabled: false, email: null, calendarId: null });
+    setGcal({ enabled: false, email: null, calendarId: null, remind: true });
     setGcalTrash([]);
     setGcalStatus({ state: "idle" });
     gcalRef.current.token = null;
