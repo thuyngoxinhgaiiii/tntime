@@ -271,6 +271,16 @@ const PRIMARY = "#F2699B";
 const SECONDARY = "#FFC94D";
 const PURPLE = "#B79CE0";
 const DANGER = "#E0637E";
+/* Màu khối "giờ rảnh đã chia sẻ với trung tâm" (xanh bạc hà nhạt) */
+const FREE_COLOR = { bg: "#DDF3E4", border: "#5FB37A", text: "#2E6B45" };
+/* Phân loại trình độ giáo viên */
+const TEACHER_LEVELS = [
+  { id: "so", label: "Sơ cấp (HSK 1–3)" },
+  { id: "trung", label: "Trung cấp (HSK 4)" },
+  { id: "cao", label: "Cao cấp (HSK 5–6)" },
+  { id: "all", label: "Tất cả trình độ (HSK 1–6)" },
+];
+const levelLabel = (id) => (TEACHER_LEVELS.find((l) => l.id === id) || {}).label || "Chưa phân loại";
 
 /* ---------------------------------------------------------------------- */
 /*  localStorage persistence                                              */
@@ -401,6 +411,8 @@ function hhmmToMin(str) {
   return (h || 0) * 60 + (m || 0);
 }
 
+function roundToHalfHour(min) { return Math.round(min / 30) * 30; }
+
 function roundToStep(min) {
   return Math.round(min / TIME_STEP_MIN) * TIME_STEP_MIN;
 }
@@ -498,6 +510,51 @@ function activeWeekly(busySlots, dk) {
   const out = {};
   Object.keys(busySlots || {}).forEach((k) => { out[k] = (busySlots[k] || []).filter((b) => !b.until || b.until >= dk); });
   return out;
+}
+
+/* Bản lịch bận gửi cho trung tâm: CHỈ có giờ bắt đầu/kết thúc —
+   không kèm ghi chú, thẻ hay ngày hết lặp (bảo mật việc riêng). */
+function busyForCenter(busySlots, dk) {
+  const act = activeWeekly(busySlots, dk);
+  const out = {};
+  Object.keys(act).forEach((k) => {
+    const list = act[k].map((b) => ({ id: String(b.id), s: Number(b.s), e: Number(b.e) })).filter((b) => b.e > b.s);
+    if (list.length) out[k] = list;
+  });
+  return out;
+}
+
+/* Giờ rảnh đã chia sẻ: { [ngày]: [{ id, s, e }] }. Luôn trừ đi giờ bận
+   (khối rảnh tự co lại), bỏ mẩu ngắn hơn 30 phút. */
+function clipFreeSlots(freeSlots, busySlots) {
+  const out = {};
+  Object.keys(freeSlots || {}).forEach((k) => {
+    const busy = (busySlots && busySlots[k]) || [];
+    const list = [];
+    (freeSlots[k] || []).forEach((f) => {
+      complementIntervals(busy, Number(f.s), Number(f.e)).forEach(([a, b], i) => {
+        if (b - a >= 30) list.push({ id: i === 0 ? String(f.id) : `${f.id}_${i}`, s: a, e: b });
+      });
+    });
+    if (list.length) out[k] = list;
+  });
+  return out;
+}
+
+/* Thêm 1 khối rảnh, gộp với các khối rảnh chồng lên nhau */
+function addFreeBlock(freeSlots, day, s, e) {
+  const list = [...((freeSlots || {})[day] || []), { id: uid(), s, e }];
+  const merged = normalizeIntervals(list).map(([a, b]) => ({ id: (list.find((x) => x.s === a) || {}).id || uid(), s: a, e: b }));
+  return { ...(freeSlots || {}), [day]: merged };
+}
+
+function totalSlotMinutes(slots) {
+  return Object.keys(slots || {}).reduce((sum, k) => sum + normalizeIntervals(slots[k]).reduce((x, [a, b]) => x + (b - a), 0), 0);
+}
+
+/* Khoảng [s,e] có nằm trọn trong giờ rảnh đã chia sẻ không */
+function isRangeInFree(freeSlots, day, s, e) {
+  return normalizeIntervals((freeSlots || {})[day] || []).some(([a, b]) => a <= s && b >= e);
 }
 
 function freeMinutesForDate(busySlots, busyOnce, d) {
@@ -2014,7 +2071,7 @@ function DashboardView({ busySlots, busyOnce, tasks, onDropTask, user }) {
 /*  Việc cần làm đã sắp xếp cũng hiện lên đây (viền nét đứt, chỉ xem).     */
 /* ---------------------------------------------------------------------- */
 
-function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks, setTags, notify }) {
+function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks, setTags, notify, user, centerIds = [] }) {
   const cal = useCalendarState();
   const [editing, setEditing] = useState(null); // { kind, mk, dk, di, id, s, e, note, tag, isDraft }
   // Khối mới kéo ra sẽ theo tag và kiểu lặp dùng gần nhất, đỡ phải chọn lại
@@ -2109,6 +2166,66 @@ function SlotEditorView({ busySlots, setBusySlots, busyOnce, setBusyOnce, tasks,
 
       <BusyBlockForm editing={editing} setEditing={setEditing} setterOf={setterOf} notify={notify} lastTagRef={lastTagRef} lastRepeatRef={lastRepeatRef} getBlock={getBlock} onJump={(dk) => cal.setAnchor(parseKey(dk))} />
       <TagManager busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} setTags={setTags} notify={notify} />
+      {user && centerIds.length > 0 && <ShareFreePanel user={user} centerIds={centerIds} busySlots={busySlots} notify={notify} />}
+    </div>
+  );
+}
+
+/* Chia sẻ giờ rảnh với trung tâm ngay từ lịch cá nhân */
+function ShareFreePanel({ user, centerIds, busySlots, notify }) {
+  const [names, setNames] = useState({});
+  const [cid, setCid] = useState(centerIds[0]);
+  const [days, setDays] = useState([]);
+  const [sVal, setSVal] = useState("18:00");
+  const [eVal, setEVal] = useState("21:00");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    centerIds.forEach((id) => db.collection("centers").doc(id).get().then((c) => { if (c.exists) setNames((p) => ({ ...p, [id]: c.data().name || "Trung tâm" })); }).catch(() => {}));
+    if (!centerIds.includes(cid)) setCid(centerIds[0]);
+  }, [centerIds.join(",")]);
+  const toggleDay = (di) => setDays((p) => (p.includes(di) ? p.filter((x) => x !== di) : [...p, di]));
+
+  const handleShare = async () => {
+    const s = roundToHalfHour(hhmmToMin(sVal)), e = roundToHalfHour(hhmmToMin(eVal));
+    if (!days.length) { notify("Chọn ít nhất 1 thứ trong tuần.", "error"); return; }
+    if (e - s < 30) { notify("Giờ kết thúc phải sau giờ bắt đầu ít nhất 30 phút.", "error"); return; }
+    setBusy(true);
+    try {
+      const ref = db.collection("centers").doc(cid).collection("members").doc(user.uid);
+      const snap = await ref.get();
+      const myBusy = busyForCenter(busySlots, todayKey());
+      let next = clipFreeSlots((snap.exists && snap.data().freeSlots) || {}, myBusy);
+      let added = 0;
+      days.forEach((di) => complementIntervals(myBusy[di] || [], s, e).filter(([a, b]) => b - a >= 30).forEach(([a, b]) => { next = addFreeBlock(next, di, a, b); added++; }));
+      if (!added) { notify("Các khung này đều trùng giờ bận của bạn nên chưa chia sẻ được.", "error"); return; }
+      await ref.update({ freeSlots: clean(next), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+      notify(`Đã chia sẻ giờ rảnh với "${names[cid] || "trung tâm"}" (phần trùng giờ bận được tự bỏ ra). Xem/sửa ở mục Trung tâm.`, "success");
+      setDays([]);
+    } catch (err) {
+      notify("Không chia sẻ được, thử lại nhé.", "error");
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="mt-4 rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <p className="mb-1 text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>Chia sẻ giờ rảnh với trung tâm</p>
+      <p className="mb-3 text-xs" style={{ color: MUTED }}>Trung tâm chỉ xếp lớp vào giờ rảnh bạn chia sẻ, và chỉ thấy giờ bận của bạn là "bận" — không thấy nội dung.</p>
+      <div className="flex flex-wrap items-end gap-2">
+        {centerIds.length > 1 && (
+          <select value={cid} onChange={(e) => setCid(e.target.value)} className="rounded-full border px-3 py-1.5 text-xs" style={{ borderColor: BORDER, color: INK }}>
+            {centerIds.map((id) => <option key={id} value={id}>{names[id] || "Trung tâm"}</option>)}
+          </select>
+        )}
+        <div className="flex flex-wrap gap-1">
+          {DAYS.map((d, di) => (
+            <button key={d.short} onClick={() => toggleDay(di)} className="rounded-full border px-2.5 py-1 text-xs font-semibold" style={days.includes(di) ? { backgroundColor: FREE_COLOR.bg, borderColor: FREE_COLOR.border, color: FREE_COLOR.text } : { borderColor: BORDER, color: MUTED }}>{d.short}</button>
+          ))}
+        </div>
+        <input type="time" step="1800" value={sVal} onChange={(e) => setSVal(e.target.value)} className="rounded-lg border px-2 py-1 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        <span className="text-xs" style={{ color: MUTED }}>→</span>
+        <input type="time" step="1800" value={eVal} onChange={(e) => setEVal(e.target.value)} className="rounded-lg border px-2 py-1 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        <button disabled={busy} onClick={handleShare} className="rounded-full px-4 py-1.5 text-xs font-semibold text-white disabled:opacity-60" style={{ backgroundColor: FREE_COLOR.border }}>Chia sẻ giờ rảnh</button>
+      </div>
     </div>
   );
 }
@@ -2684,7 +2801,7 @@ function LoadingScreen({ label = "Đang tải..." }) {
 /*  Thêm collection centers/{id} + members/{uid} + invites + assignments. */
 /* ---------------------------------------------------------------------- */
 
-function AssignmentGrid({ busySlots, assignments, onCreateDraft, onSelectAssignment }) {
+function AssignmentGrid({ busySlots, assignments, freeSlots = {}, onCreateDraft, onSelectAssignment, onSelectFree, draftColor = "#FFA94D", busyLabel = "Khung giờ bận cá nhân" }) {
   const rowH = 20;
   const labelW = 46;
   const pxPerMin = rowH / 60;
@@ -2760,14 +2877,26 @@ function AssignmentGrid({ busySlots, assignments, onCreateDraft, onSelectAssignm
                 borderRight: "1px solid #FDF3F7",
               }}
             >
+              {(freeSlots[di] || []).map((f) => (
+                <div
+                  key={"free-" + f.id}
+                  onMouseDown={onSelectFree ? (e) => e.stopPropagation() : undefined}
+                  onClick={onSelectFree ? (e) => { e.stopPropagation(); onSelectFree(di, f); } : undefined}
+                  title={`Rảnh (đã chia sẻ) ${minToHHMM(f.s)}–${minToHHMM(f.e)}`}
+                  className={"absolute left-0.5 right-0.5 overflow-hidden rounded-md border px-1 text-[9px] leading-tight" + (onSelectFree ? " cursor-pointer hover:brightness-95" : "")}
+                  style={{ top: (f.s - DAY_START_MIN) * pxPerMin, height: Math.max(6, (f.e - f.s) * pxPerMin), backgroundColor: FREE_COLOR.bg, borderColor: FREE_COLOR.border, color: FREE_COLOR.text, pointerEvents: onSelectFree ? "auto" : "none", zIndex: 1 }}
+                >
+                  {(f.e - f.s) >= 60 && <span className="font-semibold">Rảnh</span>}
+                </div>
+              ))}
               {(busySlots[di] || []).map((b) => (
-                <div key={"busy-" + b.id} style={{ position: "absolute", left: 1, right: 1, top: (b.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (b.e - b.s) * pxPerMin), backgroundColor: "#FBD9E7", opacity: 0.65, borderRadius: 4, pointerEvents: "none" }} title="Khung giờ bận cá nhân" />
+                <div key={"busy-" + b.id} style={{ position: "absolute", left: 1, right: 1, top: (b.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (b.e - b.s) * pxPerMin), backgroundColor: "#FBD9E7", opacity: 0.65, borderRadius: 4, pointerEvents: "none" }} title={busyLabel} />
               ))}
               {(assignments[di] || []).map((a) => (
                 <div
                   key={a.id}
                   onMouseDown={(e) => e.stopPropagation()}
-                  onClick={(e) => { e.stopPropagation(); onSelectAssignment(di, a); }}
+                  onClick={(e) => { e.stopPropagation(); if (onSelectAssignment) onSelectAssignment(di, a); }}
                   title={a.className || "Lớp học"}
                   className="absolute left-0.5 right-0.5 cursor-pointer overflow-hidden rounded-md border px-1 py-0.5 text-[9.5px] leading-tight hover:brightness-95"
                   style={{ top: (a.s - DAY_START_MIN) * pxPerMin, height: Math.max(8, (a.e - a.s) * pxPerMin), backgroundColor: "#FFE7CC", borderColor: "#FFA94D", color: "#8A5A12", zIndex: 2 }}
@@ -2777,7 +2906,7 @@ function AssignmentGrid({ busySlots, assignments, onCreateDraft, onSelectAssignm
                 </div>
               ))}
               {draft && draft.day === di && (
-                <div className="absolute left-0.5 right-0.5 rounded-md border-2 border-dashed" style={{ top: (draft.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (draft.e - draft.s) * pxPerMin), borderColor: "#FFA94D", backgroundColor: "#FFE7CC99" }} />
+                <div className="absolute left-0.5 right-0.5 rounded-md border-2 border-dashed" style={{ top: (draft.s - DAY_START_MIN) * pxPerMin, height: Math.max(4, (draft.e - draft.s) * pxPerMin), borderColor: draftColor, backgroundColor: draftColor + "33", zIndex: 3 }} />
               )}
             </div>
           </div>
@@ -2787,7 +2916,7 @@ function AssignmentGrid({ busySlots, assignments, onCreateDraft, onSelectAssignm
   );
 }
 
-function AssignmentEditForm({ editing, setEditing, centerId, teacherUid, busySlots, assignments, notify }) {
+function AssignmentEditForm({ editing, setEditing, centerId, teacherUid, busySlots, assignments, freeSlots, notify }) {
   const [className, setClassName] = useState(editing.className || "");
   const [sVal, setSVal] = useState(minToHHMM(editing.s));
   const [eVal, setEVal] = useState(minToHHMM(editing.e));
@@ -2804,6 +2933,7 @@ function AssignmentEditForm({ editing, setEditing, centerId, teacherUid, busySlo
     const [cs, ce] = clampRange(s, e);
     if (ce <= cs) { notify("Giờ kết thúc phải sau giờ bắt đầu.", "error"); return; }
     if (!isRangeFreeOfBusy(busySlots, editing.day, cs, ce)) { notify("Trùng với khung giờ bận cá nhân của giáo viên.", "error"); return; }
+    if (freeSlots && !isRangeInFree(freeSlots, editing.day, cs, ce)) { notify("Giáo viên chưa chia sẻ giờ rảnh cho khung giờ này.", "error"); return; }
     if (!isRangeFreeOfBusy(assignments, editing.day, cs, ce, editing.id)) { notify("Trùng với 1 lớp khác đã xếp cho giáo viên này.", "error"); return; }
     try {
       await db.collection("centers").doc(centerId).collection("assignments").doc(editing.id).set({
@@ -2856,7 +2986,11 @@ function AssignmentEditForm({ editing, setEditing, centerId, teacherUid, busySlo
 
 function TeacherCard({ centerId, teacher, assignmentsForTeacher, notify }) {
   const [editingA, setEditingA] = useState(null);
-  const freeMin = totalFreeMinutes(teacher.busySlots || {});
+  const teacherFree = useMemo(() => clipFreeSlots(teacher.freeSlots || {}, teacher.busySlots || {}), [teacher.freeSlots, teacher.busySlots]);
+  const freeMin = totalSlotMinutes(teacherFree);
+  const setLevel = (level) => db.collection("centers").doc(centerId).collection("members").doc(teacher.uid).update({ level })
+    .then(() => notify(`Đã đổi trình độ: ${levelLabel(level)}.`, "success"))
+    .catch(() => notify("Không đổi được trình độ, thử lại nhé.", "error"));
   const assignedMin = totalAssignedMinutes(assignmentsForTeacher || {});
 
   const handleCreateDraft = useCallback((day, s, e) => {
@@ -2864,6 +2998,10 @@ function TeacherCard({ centerId, teacher, assignmentsForTeacher, notify }) {
     if (ce <= cs) return;
     if (!isRangeFreeOfBusy(teacher.busySlots || {}, day, cs, ce)) {
       notify("Khung giờ này trùng với giờ bận cá nhân của giáo viên.", "error");
+      return;
+    }
+    if (!isRangeInFree(teacherFree, day, cs, ce)) {
+      notify("Giáo viên chưa chia sẻ giờ rảnh cho khung giờ này — chỉ xếp được vào ô màu xanh.", "error");
       return;
     }
     if (!isRangeFreeOfBusy(assignmentsForTeacher || {}, day, cs, ce)) {
@@ -2876,7 +3014,7 @@ function TeacherCard({ centerId, teacher, assignmentsForTeacher, notify }) {
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
     }).catch(() => notify("Không xếp được lớp, thử lại nhé.", "error"));
     setEditingA({ day, id: newId, s: cs, e: ce, className: "", isDraft: true });
-  }, [teacher, assignmentsForTeacher, centerId, notify]);
+  }, [teacher, teacherFree, assignmentsForTeacher, centerId, notify]);
 
   const handleSelectAssignment = useCallback((day, block) => {
     setEditingA({ day, id: block.id, s: block.s, e: block.e, className: block.className || "" });
@@ -2887,10 +3025,14 @@ function TeacherCard({ centerId, teacher, assignmentsForTeacher, notify }) {
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div>
           <p className="text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{teacher.email || "Giáo viên"}</p>
-          <p className="text-xs" style={{ color: MUTED }}>{formatDuration(freeMin)} rảnh/tuần · {formatDuration(assignedMin)} đã xếp lớp</p>
+          <p className="text-xs" style={{ color: MUTED }}>{formatDuration(freeMin)} rảnh đã chia sẻ/tuần · {formatDuration(assignedMin)} đã xếp lớp</p>
         </div>
+        <select value={teacher.level || ""} onChange={(e) => setLevel(e.target.value)} className="rounded-full border px-3 py-1.5 text-xs" style={{ borderColor: BORDER, color: INK }} title="Trình độ giảng dạy">
+          {!teacher.level && <option value="">Chưa phân loại trình độ</option>}
+          {TEACHER_LEVELS.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+        </select>
       </div>
-      <AssignmentGrid busySlots={teacher.busySlots || {}} assignments={assignmentsForTeacher || {}} onCreateDraft={handleCreateDraft} onSelectAssignment={handleSelectAssignment} />
+      <AssignmentGrid busySlots={teacher.busySlots || {}} assignments={assignmentsForTeacher || {}} freeSlots={teacherFree} onCreateDraft={handleCreateDraft} onSelectAssignment={handleSelectAssignment} busyLabel="Giáo viên bận (chi tiết được giữ kín)" />
       {editingA && (
         <AssignmentEditForm
           editing={editingA}
@@ -2899,16 +3041,18 @@ function TeacherCard({ centerId, teacher, assignmentsForTeacher, notify }) {
           teacherUid={teacher.uid}
           busySlots={teacher.busySlots || {}}
           assignments={assignmentsForTeacher || {}}
+          freeSlots={teacherFree}
           notify={notify}
         />
       )}
-      <p className="mt-2 text-[11px]" style={{ color: MUTED_LIGHT }}>Kéo chuột trên lịch để xếp lớp vào khung giờ trống · bấm vào 1 lớp đã xếp để sửa/xoá.</p>
+      <p className="mt-2 text-[11px]" style={{ color: MUTED_LIGHT }}>Ô xanh = giờ rảnh giáo viên đã chia sẻ · kéo chuột trong ô xanh để xếp lớp · bấm vào 1 lớp đã xếp để sửa/xoá.</p>
     </div>
   );
 }
 
 function InviteForm({ centerId, centerName, notify }) {
   const [email, setEmail] = useState("");
+  const [level, setLevel] = useState("all");
   const [busy, setBusy] = useState(false);
 
   const handleInvite = async () => {
@@ -2918,7 +3062,7 @@ function InviteForm({ centerId, centerName, notify }) {
     try {
       // Mã lời mời = chính email được mời (luật bảo mật dựa vào đó để kiểm tra)
       await db.collection("centers").doc(centerId).collection("invites").doc(normalized).set({
-        email: normalized, centerName: centerName || "", status: "pending",
+        email: normalized, centerName: centerName || "", status: "pending", level,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       setEmail("");
@@ -2933,6 +3077,9 @@ function InviteForm({ centerId, centerName, notify }) {
   return (
     <div className="flex flex-wrap gap-2">
       <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleInvite(); }} placeholder="email-giao-vien@gmail.com" className="flex-1 min-w-[200px] rounded-full border px-3 py-2 text-sm" style={{ borderColor: BORDER, color: INK }} />
+      <select value={level} onChange={(e) => setLevel(e.target.value)} className="rounded-full border px-3 py-2 text-xs" style={{ borderColor: BORDER, color: INK }} title="Trình độ giảng dạy">
+        {TEACHER_LEVELS.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+      </select>
       <button onClick={handleInvite} disabled={busy} className="flex items-center gap-1.5 rounded-full px-4 py-2 text-xs font-semibold text-white disabled:opacity-60" style={{ backgroundColor: PRIMARY }}>
         <Mail size={13} /> Mời giáo viên
       </button>
@@ -2946,7 +3093,7 @@ function OwnerInvitesList({ centerId, invites }) {
     <div className="flex flex-wrap gap-2">
       {invites.map((inv) => (
         <span key={inv.id} className="flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs" style={{ borderColor: BORDER, color: MUTED, backgroundColor: "#FFFCF7" }}>
-          {inv.email} · đang chờ
+          {inv.email}{inv.level ? ` · ${levelLabel(inv.level)}` : ""} · đang chờ
           <button onClick={() => db.collection("centers").doc(centerId).collection("invites").doc(inv.id).delete().catch(() => {})} title="Huỷ lời mời" style={{ color: MUTED_LIGHT }}>
             <XIcon size={11} />
           </button>
@@ -2956,11 +3103,562 @@ function OwnerInvitesList({ centerId, invites }) {
   );
 }
 
+/* ---------------------------------------------------------------------- */
+/*  Trung tâm — danh sách lớp cần xếp                                      */
+/*  centers/{id}/classes/{classId} = { name, level, days:[0..6], s, e,     */
+/*  teacherUid, teacherEmail, reason }. Lớp "đã xếp" khi có assignments    */
+/*  mang classId của lớp.                                                  */
+/* ---------------------------------------------------------------------- */
+
+const CLASS_LEVELS = TEACHER_LEVELS.filter((l) => l.id !== "all");
+const classDaysLabel = (c) => (c.days || []).map((d) => DAYS[d] ? DAYS[d].short : "?").join(", ");
+const classTimeLabel = (c) => `${minToHHMM(c.s)}–${minToHHMM(c.e)}`;
+
+/* Giáo viên m có dạy được lớp cls không? → { ok, why } */
+function classFitsTeacher(m, cls, teacherAssign) {
+  if (!m.level) return { ok: false, why: "chưa phân loại trình độ" };
+  if (m.level !== "all" && m.level !== cls.level) return { ok: false, why: `chỉ dạy ${levelLabel(m.level)}` };
+  const free = clipFreeSlots(m.freeSlots || {}, m.busySlots || {});
+  for (const di of cls.days || []) {
+    if (!isRangeInFree(free, di, cls.s, cls.e)) return { ok: false, why: `chưa rảnh ${DAYS[di].short} ${classTimeLabel(cls)}` };
+    const clash = ((teacherAssign || {})[di] || []).some((a) => a.classId !== cls.id && a.s < cls.e && a.e > cls.s);
+    if (clash) return { ok: false, why: `trùng lớp khác ${DAYS[di].short}` };
+  }
+  return { ok: true, why: "" };
+}
+
+async function assignClassToTeacher(centerId, cls, m, reason) {
+  const cref = db.collection("centers").doc(centerId);
+  const old = await cref.collection("assignments").where("classId", "==", cls.id).get();
+  const batch = db.batch();
+  old.docs.forEach((d) => batch.delete(d.ref));
+  (cls.days || []).forEach((di) => {
+    batch.set(cref.collection("assignments").doc(uid()), {
+      teacherUid: m.uid, day: di, s: cls.s, e: cls.e, className: cls.name, classId: cls.id,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+  batch.update(cref.collection("classes").doc(cls.id), { teacherUid: m.uid, teacherEmail: m.email || "", reason: reason || "" });
+  await batch.commit();
+}
+
+async function unassignClass(centerId, cls, alsoDeleteClass) {
+  const cref = db.collection("centers").doc(centerId);
+  const old = await cref.collection("assignments").where("classId", "==", cls.id).get();
+  const batch = db.batch();
+  old.docs.forEach((d) => batch.delete(d.ref));
+  if (alsoDeleteClass) batch.delete(cref.collection("classes").doc(cls.id));
+  else batch.update(cref.collection("classes").doc(cls.id), { teacherUid: null, teacherEmail: "", reason: "" });
+  await batch.commit();
+}
+
+/* Đọc trình độ / thứ trong tuần từ chữ người dùng gõ (Excel) */
+function parseClassLevel(v) {
+  const t = stripVN(v);
+  if (!t) return null;
+  if (t.includes("socap") || t.startsWith("so")) return "so";
+  if (t.includes("trung")) return "trung";
+  if (t.includes("cao")) return "cao";
+  const m = /([1-6])/.exec(t.replace(/^hsk/, ""));
+  if (m) { const n = +m[1]; return n <= 3 ? "so" : n === 4 ? "trung" : "cao"; }
+  return null;
+}
+function parseClassDays(v) {
+  const t = stripVN(v).replace(/chunhat|cn/g, "8");
+  const ds = (t.match(/[2-8]/g) || []).map((x) => +x - 2);
+  return [...new Set(ds)].sort((a, b) => a - b);
+}
+
+const CLASS_HEADERS = {
+  name: ["tenlop", "tenlophoc", "malop", "malopten", "lop", "ten"],
+  level: ["trinhdo", "capdo", "level", "trinhdoyeucau"],
+  days: ["thu", "thutrongtuan", "ngayhoc", "lichhoc", "cacthu"],
+  s: ["giobatdau", "batdau", "tugio"],
+  e: ["gioketthuc", "ketthuc", "dengio"],
+};
+
+function rowToClass(row) {
+  const errs = [];
+  const name = String(row.name == null ? "" : row.name).trim();
+  if (!name) errs.push("thiếu tên lớp");
+  const level = parseClassLevel(row.level);
+  if (!level) errs.push("trình độ không rõ (Sơ cấp / Trung cấp / Cao cấp)");
+  const days = parseClassDays(row.days);
+  if (!days.length) errs.push("thiếu thứ học (VD: T3, T5)");
+  let st = cellToMinutes(row.s), en = cellToMinutes(row.e);
+  if (st === null || st === "") errs.push("giờ bắt đầu sai"); else st = roundToHalfHour(st);
+  if (en === null || en === "") errs.push("giờ kết thúc sai"); else en = roundToHalfHour(en);
+  if (typeof st === "number" && typeof en === "number" && en - st < 30) errs.push("giờ kết thúc phải sau giờ bắt đầu");
+  return { errs, cls: { name, level: level || "so", days, s: Number(st) || 0, e: Number(en) || 0 } };
+}
+
+function ClassForm({ onSave, onCancel }) {
+  const [name, setName] = useState("");
+  const [level, setLevel] = useState("so");
+  const [days, setDays] = useState([]);
+  const [sVal, setSVal] = useState("18:00");
+  const [eVal, setEVal] = useState("19:30");
+  const toggle = (di) => setDays((p) => (p.includes(di) ? p.filter((x) => x !== di) : [...p, di].sort((a, b) => a - b)));
+  const submit = () => {
+    const st = roundToHalfHour(hhmmToMin(sVal)), en = roundToHalfHour(hhmmToMin(eVal));
+    if (!name.trim()) return onSave(null, "Nhập tên lớp.");
+    if (!days.length) return onSave(null, "Chọn ít nhất 1 thứ học.");
+    if (en - st < 30) return onSave(null, "Giờ kết thúc phải sau giờ bắt đầu.");
+    onSave({ name: name.trim(), level, days, s: st, e: en });
+  };
+  return (
+    <div className="mb-3 rounded-xl border p-3" style={{ borderColor: BORDER, backgroundColor: "#FFFCF7" }}>
+      <div className="mb-2 grid gap-2 sm:grid-cols-2">
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Tên lớp, VD: HSK3 tối T3-T5" className="rounded-lg border px-2 py-1.5 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        <select value={level} onChange={(e) => setLevel(e.target.value)} className="rounded-lg border px-2 py-1.5 text-sm" style={{ borderColor: BORDER, color: INK }}>
+          {CLASS_LEVELS.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+        </select>
+      </div>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {DAYS.map((d, di) => (
+          <button key={d.short} onClick={() => toggle(di)} className="rounded-full border px-2.5 py-1 text-xs font-semibold" style={days.includes(di) ? { backgroundColor: PRIMARY, borderColor: PRIMARY, color: "#FFFFFF" } : { borderColor: BORDER, color: MUTED }}>{d.short}</button>
+        ))}
+        <input type="time" step="1800" value={sVal} onChange={(e) => setSVal(e.target.value)} className="rounded-lg border px-2 py-1 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        <span className="text-xs" style={{ color: MUTED }}>→</span>
+        <input type="time" step="1800" value={eVal} onChange={(e) => setEVal(e.target.value)} className="rounded-lg border px-2 py-1 text-sm" style={{ borderColor: BORDER, color: INK }} />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={submit} className="rounded-full px-4 py-1.5 text-xs font-semibold text-white" style={{ backgroundColor: PRIMARY }}>Tạo lớp</button>
+        <button onClick={onCancel} className="rounded-full border px-3 py-1.5 text-xs font-medium" style={{ borderColor: BORDER, color: "#8A6070" }}>Huỷ</button>
+      </div>
+    </div>
+  );
+}
+
+function ClassExcelImport({ centerId, notify }) {
+  const [busy, setBusy] = useState(false);
+  const [rows, setRows] = useState(null);
+  const fileRef = useRef(null);
+  const downloadTemplate = async () => {
+    try {
+      setBusy(true);
+      const XLSX = await loadXLSX();
+      const ws = XLSX.utils.aoa_to_sheet([
+        ["Tên lớp", "Trình độ", "Thứ", "Giờ bắt đầu", "Giờ kết thúc"],
+        ["HSK3 tối T3-T5", "Sơ cấp (HSK 1-3)", "T3, T5", "18:00", "19:30"],
+        ["HSK4 tối T2-T4-T6", "Trung cấp (HSK 4)", "T2, T4, T6", "19:30", "21:00"],
+        ["HSK5 cuối tuần", "Cao cấp (HSK 5-6)", "T7, CN", "09:00", "11:00"],
+      ]);
+      ws["!cols"] = [{ wch: 24 }, { wch: 20 }, { wch: 14 }, { wch: 12 }, { wch: 12 }];
+      const ws2 = XLSX.utils.aoa_to_sheet([
+        ["Hướng dẫn"],
+        ["• Mỗi dòng là 1 lớp. Các buổi trong tuần của 1 lớp học cùng khung giờ."],
+        ["• Trình độ: Sơ cấp (HSK 1-3), Trung cấp (HSK 4), Cao cấp (HSK 5-6) — hoặc ghi HSK2, HSK5..."],
+        ["• Thứ: T2, T3, ... T7, CN (cách nhau bằng dấu phẩy)."],
+        ["• Giờ dạng 18:00, làm tròn theo bước 30 phút."],
+      ]);
+      ws2["!cols"] = [{ wch: 90 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Lop hoc");
+      XLSX.utils.book_append_sheet(wb, ws2, "Huong dan");
+      XLSX.writeFile(wb, "TNTime-mau-lop-hoc.xlsx");
+    } catch (e) {
+      notify("Không tải được thư viện Excel, kiểm tra kết nối mạng.", "error");
+    } finally { setBusy(false); }
+  };
+  const onFile = async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    try {
+      setBusy(true);
+      const XLSX = await loadXLSX();
+      const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "", raw: true });
+      const hi = aoa.findIndex((r) => r.some((c) => CLASS_HEADERS.name.includes(stripVN(c))));
+      if (hi < 0) { notify('Không tìm thấy cột "Tên lớp". Hãy dùng file mẫu nhé.', "error"); return; }
+      const colOf = {};
+      [true, false].forEach((exact) => aoa[hi].forEach((c, i) => {
+        const h = stripVN(c);
+        Object.keys(CLASS_HEADERS).forEach((k) => {
+          if (colOf[k] == null && !Object.values(colOf).includes(i) && CLASS_HEADERS[k].some((x) => h === x || (!exact && x.length > 3 && h.startsWith(x)))) colOf[k] = i;
+        });
+      }));
+      const out = aoa.slice(hi + 1).filter((r) => r.some((c) => String(c).trim() !== "")).map((r) => {
+        const row = {}; Object.keys(colOf).forEach((k) => { row[k] = r[colOf[k]]; });
+        return rowToClass(row);
+      });
+      if (!out.length) { notify("File không có dòng lớp nào.", "error"); return; }
+      setRows(out);
+    } catch (e) {
+      notify("Không đọc được file. Hãy chọn file .xlsx, .xls hoặc .csv.", "error");
+    } finally { setBusy(false); }
+  };
+  const okRows = rows ? rows.filter((r) => !r.errs.length) : [];
+  const confirm = async () => {
+    try {
+      const batch = db.batch();
+      okRows.forEach((r) => batch.set(db.collection("centers").doc(centerId).collection("classes").doc(uid()), { ...r.cls, teacherUid: null, teacherEmail: "", reason: "", createdAt: firebase.firestore.FieldValue.serverTimestamp() }));
+      await batch.commit();
+      notify(`Đã thêm ${okRows.length} lớp vào danh sách chờ xếp.`, "success");
+      setRows(null);
+    } catch (e) { notify("Không lưu được danh sách lớp, thử lại nhé.", "error"); }
+  };
+  return (
+    <>
+      <button disabled={busy} onClick={downloadTemplate} className="rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>File mẫu</button>
+      <button disabled={busy} onClick={() => fileRef.current && fileRef.current.click()} className="flex items-center gap-1 rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>
+        <Upload size={13} /> {busy ? "Đang xử lý..." : "Nhập Excel"}
+      </button>
+      <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" onChange={onFile} className="hidden" />
+      {rows && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(74,46,62,0.35)" }} onClick={() => setRows(null)}>
+          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }} onClick={(e) => e.stopPropagation()}>
+            <p className="mb-1 text-sm font-semibold" style={{ color: INK }}>Xem trước danh sách lớp từ Excel</p>
+            <p className="mb-3 text-xs" style={{ color: MUTED }}>
+              {okRows.length} dòng hợp lệ{rows.length - okRows.length ? <span style={{ color: DANGER }}> · {rows.length - okRows.length} dòng lỗi (sẽ bỏ qua — sửa trong Excel rồi tải lại)</span> : ""}
+            </p>
+            <div className="flex-1 overflow-auto rounded-xl border" style={{ borderColor: BORDER }}>
+              <table className="w-full text-xs" style={{ color: INK }}>
+                <thead style={{ backgroundColor: "#FFF6FA" }}>
+                  <tr>{["#", "Tên lớp", "Trình độ", "Thứ", "Giờ", "Ghi chú"].map((h) => <th key={h} className="whitespace-nowrap px-2 py-1.5 text-left font-semibold">{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, i) => {
+                    const c = r.cls, bad = r.errs.length > 0;
+                    return (
+                      <tr key={i} className="border-t" style={{ borderColor: BORDER, backgroundColor: bad ? "#FEF2F5" : "transparent" }}>
+                        <td className="px-2 py-1.5" style={{ color: MUTED }}>{i + 1}</td>
+                        <td className="px-2 py-1.5 font-medium">{c.name || "—"}</td>
+                        <td className="whitespace-nowrap px-2 py-1.5">{levelLabel(c.level)}</td>
+                        <td className="whitespace-nowrap px-2 py-1.5">{classDaysLabel(c) || "—"}</td>
+                        <td className="whitespace-nowrap px-2 py-1.5">{classTimeLabel(c)}</td>
+                        <td className="px-2 py-1.5" style={{ color: bad ? DANGER : MUTED }}>{bad ? r.errs.join("; ") : "✓"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 flex justify-end gap-2">
+              <button onClick={() => setRows(null)} className="rounded-full border px-3 py-2 text-xs font-medium" style={{ borderColor: BORDER, color: "#8A6070" }}>Huỷ</button>
+              <button disabled={!okRows.length} onClick={confirm} className="rounded-full px-4 py-2 text-xs font-semibold text-white" style={{ backgroundColor: okRows.length ? PRIMARY : MUTED_LIGHT }}>Thêm {okRows.length} lớp</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function ClassRow({ cls, centerId, members, assignmentsByTeacher, matched, notify }) {
+  const [pick, setPick] = useState("");
+  const [busy, setBusy] = useState(false);
+  const teacher = members.find((m) => m.uid === cls.teacherUid);
+  const fits = members.map((m) => ({ m, ...classFitsTeacher(m, cls, assignmentsByTeacher[m.uid]) }));
+  const doAssign = async () => {
+    const f = fits.find((x) => x.m.uid === pick);
+    if (!f) return;
+    setBusy(true);
+    try { await assignClassToTeacher(centerId, cls, f.m, "Xếp tay"); notify(`Đã xếp lớp ${cls.name} cho ${f.m.email || "giáo viên"}.`, "success"); setPick(""); }
+    catch (e) { notify("Không xếp được lớp, thử lại nhé.", "error"); }
+    finally { setBusy(false); }
+  };
+  const doUnassign = async () => {
+    setBusy(true);
+    try { await unassignClass(centerId, cls, false); notify(`Đã gỡ giáo viên khỏi lớp ${cls.name}.`, "success"); }
+    catch (e) { notify("Không gỡ được, thử lại nhé.", "error"); }
+    finally { setBusy(false); }
+  };
+  const doDelete = async () => {
+    if (!window.confirm(`Xoá lớp "${cls.name}"? Các buổi đã xếp của lớp này cũng sẽ bị xoá.`)) return;
+    try { await unassignClass(centerId, cls, true); } catch (e) { notify("Không xoá được lớp, thử lại nhé.", "error"); }
+  };
+  return (
+    <tr className="border-t align-top" style={{ borderColor: BORDER }}>
+      <td className="px-2 py-2 font-semibold" style={{ color: INK }}>{cls.name}</td>
+      <td className="whitespace-nowrap px-2 py-2">{levelLabel(cls.level)}</td>
+      <td className="whitespace-nowrap px-2 py-2">{classDaysLabel(cls)} · {classTimeLabel(cls)}</td>
+      <td className="px-2 py-2">
+        {matched ? (
+          <div>
+            <p className="font-medium" style={{ color: FREE_COLOR.text }}>{(teacher && teacher.email) || cls.teacherEmail || "Giáo viên"}</p>
+            {cls.reason && <p className="text-[11px]" style={{ color: MUTED }}>{cls.reason}</p>}
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <select value={pick} onChange={(e) => setPick(e.target.value)} className="max-w-[220px] rounded-lg border px-2 py-1 text-xs" style={{ borderColor: BORDER, color: INK }}>
+              <option value="">— Chọn giáo viên —</option>
+              {fits.map((f) => <option key={f.m.uid} value={f.m.uid} disabled={!f.ok}>{(f.m.email || "Giáo viên") + (f.ok ? " ✓" : ` (${f.why})`)}</option>)}
+            </select>
+            <button disabled={!pick || busy} onClick={doAssign} className="rounded-full px-3 py-1 text-xs font-semibold text-white disabled:opacity-50" style={{ backgroundColor: "#FFA94D" }}>Xếp</button>
+            {cls.reason && <p className="w-full text-[11px]" style={{ color: DANGER }}>{cls.reason}</p>}
+          </div>
+        )}
+      </td>
+      <td className="whitespace-nowrap px-2 py-2">
+        <span className="rounded-full border px-2 py-0.5 text-[11px] font-semibold" style={matched ? { borderColor: FREE_COLOR.border, backgroundColor: FREE_COLOR.bg, color: FREE_COLOR.text } : { borderColor: "#FFA94D", backgroundColor: "#FFF6E9", color: "#8A5A12" }}>{matched ? "Đã xếp" : "Đang chờ"}</span>
+      </td>
+      <td className="whitespace-nowrap px-2 py-2 text-right">
+        {matched && <button disabled={busy} onClick={doUnassign} className="mr-1 rounded-full border px-2 py-0.5 text-[11px]" style={{ borderColor: BORDER, color: "#8A6070" }}>Gỡ</button>}
+        <button onClick={doDelete} title="Xoá lớp" className="rounded-full p-1" style={{ color: DANGER }}><Trash2 size={13} /></button>
+      </td>
+    </tr>
+  );
+}
+
+function ClassesPanel({ centerId, classes, members, assignmentsByTeacher, matchedIds, notify, extraActions }) {
+  const [adding, setAdding] = useState(false);
+  const saveClass = async (cls, err) => {
+    if (!cls) { notify(err, "error"); return; }
+    try {
+      await db.collection("centers").doc(centerId).collection("classes").doc(uid()).set({ ...cls, teacherUid: null, teacherEmail: "", reason: "", createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+      notify(`Đã thêm lớp ${cls.name}.`, "success");
+      setAdding(false);
+    } catch (e) { notify("Không thêm được lớp, thử lại nhé.", "error"); }
+  };
+  const sorted = [...classes].sort((a, b) => (matchedIds.has(a.id) - matchedIds.has(b.id)) || String(a.name).localeCompare(String(b.name)));
+  return (
+    <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <div className="mr-auto">
+          <p className="text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>Danh sách lớp học</p>
+          <p className="text-xs" style={{ color: MUTED }}>Lớp chỉ xếp được cho giáo viên đúng trình độ và đã chia sẻ giờ rảnh trùng lịch lớp.</p>
+        </div>
+        {extraActions}
+        <ClassExcelImport centerId={centerId} notify={notify} />
+        <button onClick={() => setAdding((v) => !v)} className="flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-semibold text-white" style={{ backgroundColor: PRIMARY }}><Plus size={13} /> Thêm lớp</button>
+      </div>
+      {adding && <ClassForm onSave={saveClass} onCancel={() => setAdding(false)} />}
+      {classes.length === 0 ? (
+        <p className="rounded-xl border border-dashed p-4 text-center text-xs" style={{ borderColor: BORDER, color: MUTED }}>Chưa có lớp nào. Bấm "Thêm lớp" hoặc nhập danh sách từ Excel.</p>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border" style={{ borderColor: BORDER }}>
+          <table className="w-full text-xs" style={{ color: INK, minWidth: 640 }}>
+            <thead style={{ backgroundColor: "#FFF6FA" }}>
+              <tr>{["Lớp", "Trình độ", "Lịch học", "Giáo viên", "Trạng thái", ""].map((h, i) => <th key={i} className="whitespace-nowrap px-2 py-1.5 text-left font-semibold">{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {sorted.map((c) => <ClassRow key={c.id} cls={c} centerId={centerId} members={members} assignmentsByTeacher={assignmentsByTeacher} matched={matchedIds.has(c.id)} notify={notify} />)}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Tự động xếp lịch: ghép lớp đang chờ với giáo viên                      */
+/*  - đúng trình độ, giờ rảnh đã chia sẻ phủ mọi buổi, không trùng lớp khác */
+/*  - lớp ít giáo viên phù hợp nhất được xếp trước                          */
+/*  - nhiều người cùng hợp → ưu tiên người đang có ít giờ dạy hơn           */
+/* ---------------------------------------------------------------------- */
+function autoMatchClasses(pending, members, assignmentsByTeacher) {
+  const work = {};
+  members.forEach((m) => {
+    work[m.uid] = {};
+    Object.keys(assignmentsByTeacher[m.uid] || {}).forEach((d) => { work[m.uid][d] = [...assignmentsByTeacher[m.uid][d]]; });
+  });
+  const load = (u) => Object.values(work[u] || {}).reduce((x, l) => x + l.reduce((y, a) => y + (a.e - a.s), 0), 0);
+  const results = [];
+  let left = [...pending];
+  while (left.length) {
+    const scored = left.map((c) => ({ c, fits: members.map((m) => ({ m, ...classFitsTeacher(m, c, work[m.uid]) })) }))
+      .map((x) => ({ ...x, cands: x.fits.filter((f) => f.ok) }));
+    const none = scored.filter((x) => !x.cands.length);
+    none.forEach((x) => {
+      const why = !members.length ? "Trung tâm chưa có giáo viên"
+        : "Không có giáo viên phù hợp — " + x.fits.slice(0, 3).map((f) => `${(f.m.email || "GV").split("@")[0]}: ${f.why}`).join("; ") + (x.fits.length > 3 ? "…" : "");
+      results.push({ cls: x.c, m: null, reason: why });
+    });
+    const can = scored.filter((x) => x.cands.length).sort((a, b) => a.cands.length - b.cands.length || ((b.c.days || []).length - (a.c.days || []).length));
+    if (!can.length) break;
+    const pick = can[0];
+    const best = [...pick.cands].sort((a, b) => load(a.m.uid) - load(b.m.uid))[0];
+    const c = pick.c;
+    (c.days || []).forEach((di) => { work[best.m.uid][di] = [...(work[best.m.uid][di] || []), { s: c.s, e: c.e, classId: c.id }]; });
+    const hrs = formatDuration(load(best.m.uid) - (c.e - c.s) * (c.days || []).length);
+    results.push({
+      cls: c, m: best.m,
+      reason: `Tự động: đúng trình độ, rảnh ${classDaysLabel(c)} ${classTimeLabel(c)}` + (pick.cands.length > 1 ? `; ${pick.cands.length} GV phù hợp, chọn người ít giờ dạy nhất (${hrs})` : "; GV duy nhất phù hợp"),
+    });
+    left = left.filter((x) => x.id !== c.id && !none.some((n) => n.c.id === x.id));
+  }
+  return results;
+}
+
+function AutoMatchButton({ centerId, classes, members, assignmentsByTeacher, matchedIds, notify }) {
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const pending = classes.filter((c) => !matchedIds.has(c.id));
+  const run = () => {
+    if (!pending.length) { notify("Không còn lớp nào đang chờ xếp.", "success"); return; }
+    setPreview(autoMatchClasses(pending, members, assignmentsByTeacher));
+  };
+  const okList = preview ? preview.filter((r) => r.m) : [];
+  const confirm = async () => {
+    setBusy(true);
+    try {
+      for (const r of preview) {
+        if (r.m) await assignClassToTeacher(centerId, r.cls, r.m, r.reason);
+        else await db.collection("centers").doc(centerId).collection("classes").doc(r.cls.id).update({ reason: r.reason });
+      }
+      notify(`Đã xếp ${okList.length}/${preview.length} lớp${okList.length < preview.length ? " — lớp chưa xếp được có ghi lý do trong danh sách" : ""}.`, okList.length < preview.length ? "error" : "success");
+      setPreview(null);
+    } catch (e) { notify("Có lỗi khi lưu, một số lớp có thể chưa được xếp — kiểm tra lại danh sách.", "error"); }
+    finally { setBusy(false); }
+  };
+  return (
+    <>
+      <button onClick={run} className="flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-semibold text-white" style={{ backgroundColor: "#FFA94D" }}><Sparkles size={13} /> Tự động xếp lịch</button>
+      {preview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "rgba(74,46,62,0.35)" }} onClick={() => !busy && setPreview(null)}>
+          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }} onClick={(e) => e.stopPropagation()}>
+            <p className="mb-1 text-sm font-semibold" style={{ color: INK }}>Kết quả xếp lịch (chưa lưu)</p>
+            <p className="mb-3 text-xs" style={{ color: MUTED }}>Xếp được {okList.length}/{preview.length} lớp. Kiểm tra rồi bấm Xác nhận để lưu.</p>
+            <div className="flex-1 overflow-auto rounded-xl border" style={{ borderColor: BORDER }}>
+              <table className="w-full text-xs" style={{ color: INK }}>
+                <thead style={{ backgroundColor: "#FFF6FA" }}>
+                  <tr>{["Lớp", "Lịch học", "Giáo viên", "Lý do"].map((h) => <th key={h} className="whitespace-nowrap px-2 py-1.5 text-left font-semibold">{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {preview.map((r) => (
+                    <tr key={r.cls.id} className="border-t align-top" style={{ borderColor: BORDER, backgroundColor: r.m ? "transparent" : "#FEF2F5" }}>
+                      <td className="px-2 py-1.5 font-medium">{r.cls.name}<div className="text-[11px]" style={{ color: MUTED }}>{levelLabel(r.cls.level)}</div></td>
+                      <td className="whitespace-nowrap px-2 py-1.5">{classDaysLabel(r.cls)} · {classTimeLabel(r.cls)}</td>
+                      <td className="px-2 py-1.5 font-medium" style={{ color: r.m ? FREE_COLOR.text : DANGER }}>{r.m ? (r.m.email || "Giáo viên") : "Chưa xếp được"}</td>
+                      <td className="px-2 py-1.5" style={{ color: r.m ? MUTED : DANGER }}>{r.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 flex justify-end gap-2">
+              <button disabled={busy} onClick={() => setPreview(null)} className="rounded-full border px-3 py-2 text-xs font-medium" style={{ borderColor: BORDER, color: "#8A6070" }}>Huỷ</button>
+              <button disabled={busy} onClick={confirm} className="rounded-full px-4 py-2 text-xs font-semibold text-white disabled:opacity-60" style={{ backgroundColor: PRIMARY }}>{busy ? "Đang lưu..." : `Xác nhận xếp ${okList.length} lớp`}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+/* Thời khóa biểu tổng quan: mọi lớp đã xếp của trung tâm trên 1 lịch tuần */
+function CenterOverview({ members, assignList, classes }) {
+  const [open, setOpen] = useState(true);
+  const [fTeacher, setFTeacher] = useState("");
+  const [fLevel, setFLevel] = useState("");
+  const rowH = 20, labelW = 46, pxPerMin = rowH / 60, totalHeight = HOURS.length * rowH;
+  const colorOf = {};
+  const OV_COLORS = ["#6FA8DC", "#FFA94D", "#7CC576", "#B79CE0", "#E5646E", "#4DB6AC", "#F2C14E", "#7E8CE0", "#A1887F", "#F2699B", "#90A4AE"];
+  members.forEach((m, i) => { colorOf[m.uid] = OV_COLORS[i % OV_COLORS.length]; });
+  const clsById = {};
+  classes.forEach((c) => { clsById[c.id] = c; });
+  const shown = assignList.filter((a) => {
+    if (fTeacher && a.teacherUid !== fTeacher) return false;
+    if (fLevel) {
+      const c = a.classId && clsById[a.classId];
+      if (!c || c.level !== fLevel) return false;
+    }
+    return members.some((m) => m.uid === a.teacherUid);
+  });
+  const selTeacher = fTeacher ? members.find((m) => m.uid === fTeacher) : null;
+  const selFree = selTeacher ? clipFreeSlots(selTeacher.freeSlots || {}, selTeacher.busySlots || {}) : {};
+  const scrollRef = useRef(null);
+  useEffect(() => { if (open && scrollRef.current) scrollRef.current.scrollTop = 7 * rowH; }, [open]);
+  const lanesOf = (list) => {
+    const sorted = [...list].sort((a, b) => a.s - b.s || a.e - b.e);
+    const ends = [];
+    const out = sorted.map((a) => {
+      let lane = ends.findIndex((e) => e <= a.s);
+      if (lane < 0) { lane = ends.length; ends.push(a.e); } else ends[lane] = a.e;
+      return { a, lane };
+    });
+    return { out, n: Math.max(1, ends.length) };
+  };
+  return (
+    <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <div className="mr-auto">
+          <p className="text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>Thời khóa biểu tổng quan</p>
+          <p className="text-xs" style={{ color: MUTED }}>Tất cả lớp đã xếp của trung tâm · mỗi giáo viên một màu{selTeacher ? " · ô xanh = giờ rảnh đã chia sẻ" : ""}</p>
+        </div>
+        {open && (
+          <>
+            <select value={fTeacher} onChange={(e) => setFTeacher(e.target.value)} className="rounded-full border px-3 py-1.5 text-xs" style={{ borderColor: BORDER, color: INK }}>
+              <option value="">Tất cả giáo viên</option>
+              {members.map((m) => <option key={m.uid} value={m.uid}>{m.email || "Giáo viên"}</option>)}
+            </select>
+            <select value={fLevel} onChange={(e) => setFLevel(e.target.value)} className="rounded-full border px-3 py-1.5 text-xs" style={{ borderColor: BORDER, color: INK }}>
+              <option value="">Mọi trình độ</option>
+              {CLASS_LEVELS.map((l) => <option key={l.id} value={l.id}>{l.label}</option>)}
+            </select>
+          </>
+        )}
+        <button onClick={() => setOpen((v) => !v)} className="rounded-full border px-3 py-1.5 text-xs font-medium" style={{ borderColor: BORDER, color: "#8A6070" }}>{open ? "Thu gọn" : "Mở lịch"}</button>
+      </div>
+      {open && (
+        <>
+          <div className="mb-2 flex flex-wrap gap-2">
+            {members.map((m) => (
+              <span key={m.uid} className="flex items-center gap-1 text-[11px]" style={{ color: INK }}>
+                <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: colorOf[m.uid] }} />{(m.email || "GV").split("@")[0]}
+              </span>
+            ))}
+          </div>
+          <div ref={scrollRef} className="overflow-auto rounded-xl" style={{ maxHeight: "65vh" }}>
+            <div className="flex select-none" style={{ minWidth: 640 }}>
+              <div style={{ width: labelW, flexShrink: 0, position: "sticky", left: 0, zIndex: 6, backgroundColor: "#FFFFFF" }}>
+                <div style={{ height: 20, position: "sticky", top: 0, zIndex: 7, backgroundColor: "#FFFFFF" }} />
+                <div style={{ position: "relative", height: totalHeight }}>
+                  {HOURS.map((h) => <div key={h} style={{ position: "absolute", top: Math.max(1, (h - HOUR_START) * rowH - 6), right: 4, fontSize: 9.5, color: MUTED_LIGHT }}>{pad2(h)}:00</div>)}
+                </div>
+              </div>
+              {DAYS.map((d, di) => {
+                const { out, n } = lanesOf(shown.filter((a) => a.day === di));
+                return (
+                  <div key={d.short} style={{ flex: 1, minWidth: 64 }}>
+                    <div className="flex items-end justify-center pb-1 text-[10.5px] font-semibold" style={{ height: 20, position: "sticky", top: 0, zIndex: 5, backgroundColor: "#FFFFFF", borderBottom: "1px solid #FBEAF1", color: PRIMARY, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{d.short}</div>
+                    <div className="ovcol" style={{ position: "relative", height: totalHeight, backgroundColor: "#FFFCFD", backgroundImage: `repeating-linear-gradient(to bottom, #FBEAF1 0, #FBEAF1 1px, transparent 1px, transparent ${rowH}px)`, borderLeft: di === 0 ? "1px solid #FBEAF1" : "1px solid #FDF3F7", borderRight: "1px solid #FDF3F7" }}>
+                      {(selFree[di] || []).map((f) => (
+                        <div key={f.id} style={{ position: "absolute", left: 1, right: 1, top: (f.s - DAY_START_MIN) * pxPerMin, height: (f.e - f.s) * pxPerMin, backgroundColor: FREE_COLOR.bg, border: `1px dashed ${FREE_COLOR.border}`, borderRadius: 4 }} />
+                      ))}
+                      {out.map(({ a, lane }) => {
+                        const pal = tagPalette(colorOf[a.teacherUid] || PRIMARY);
+                        const t = members.find((m) => m.uid === a.teacherUid);
+                        return (
+                          <div key={a.id} className="ovblock absolute overflow-hidden rounded-md border px-1 py-0.5 text-[9.5px] leading-tight"
+                            title={`${a.className || "Lớp"} · ${minToHHMM(a.s)}–${minToHHMM(a.e)} · ${(t && t.email) || ""}`}
+                            style={{ top: (a.s - DAY_START_MIN) * pxPerMin, height: Math.max(10, (a.e - a.s) * pxPerMin), left: `calc(${(lane / n) * 100}% + 1px)`, width: `calc(${100 / n}% - 2px)`, backgroundColor: pal.bg, borderColor: pal.border, color: pal.text, zIndex: 2 }}>
+                            <span className="font-semibold">{a.className || "Lớp"}</span>
+                            <div className="truncate opacity-90">{minToHHMM(a.s)}–{minToHHMM(a.e)}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          {shown.length === 0 && <p className="mt-2 text-center text-xs" style={{ color: MUTED }}>Chưa có lớp nào được xếp{fTeacher || fLevel ? " theo bộ lọc này" : ""}.</p>}
+        </>
+      )}
+    </div>
+  );
+}
+
 function CenterOwnerDashboard({ ownedCenterId, notify }) {
   const [center, setCenter] = useState(null);
   const [members, setMembers] = useState([]);
   const [assignmentsByTeacher, setAssignmentsByTeacher] = useState({});
   const [invites, setInvites] = useState([]);
+  const [classes, setClasses] = useState([]);
+  const [assignList, setAssignList] = useState([]);
+
+  useEffect(() => {
+    const unsub5 = db.collection("centers").doc(ownedCenterId).collection("classes").onSnapshot((snap) => {
+      setClasses(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    }, () => {});
+    return () => unsub5();
+  }, [ownedCenterId]);
 
   useEffect(() => {
     const unsub1 = db.collection("centers").doc(ownedCenterId).onSnapshot((snap) => setCenter(snap.exists ? { id: snap.id, ...snap.data() } : null));
@@ -2969,6 +3667,7 @@ function CenterOwnerDashboard({ ownedCenterId, notify }) {
     }, () => {});
     const unsub3 = db.collection("centers").doc(ownedCenterId).collection("assignments").onSnapshot((snap) => {
       const byTeacher = {};
+      setAssignList(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       snap.docs.forEach((d) => {
         const a = { id: d.id, ...d.data() };
         byTeacher[a.teacherUid] = byTeacher[a.teacherUid] || {};
@@ -2983,8 +3682,18 @@ function CenterOwnerDashboard({ ownedCenterId, notify }) {
     return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
   }, [ownedCenterId]);
 
+  const matchedIds = new Set(assignList.map((a) => a.classId).filter(Boolean));
+  const pendingCount = classes.filter((c) => !matchedIds.has(c.id)).length;
+  const teachMin = assignList.reduce((x, a) => x + Math.max(0, (a.e || 0) - (a.s || 0)), 0);
+
   return (
     <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <StatCard icon={Users2} label="Giáo viên" value={members.length} sub={invites.length ? `${invites.length} lời mời đang chờ` : null} accent={PRIMARY} />
+        <StatCard icon={ListChecks} label="Lớp đang chờ xếp" value={pendingCount} accent="#FFA94D" />
+        <StatCard icon={CheckCircle2} label="Lớp đã xếp" value={classes.length - pendingCount} accent={FREE_COLOR.border} />
+        <StatCard icon={Clock3} label="Giờ dạy đã xếp / tuần" value={formatDuration(teachMin)} accent={PURPLE} />
+      </div>
       <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
         <div className="mb-3">
           <p className="text-sm font-medium" style={{ color: INK }}>{center?.name || "Trung tâm của bạn"}</p>
@@ -2993,6 +3702,11 @@ function CenterOwnerDashboard({ ownedCenterId, notify }) {
         <InviteForm centerId={ownedCenterId} centerName={center?.name} notify={notify} />
         <div className="mt-2"><OwnerInvitesList centerId={ownedCenterId} invites={invites} /></div>
       </div>
+
+      <ClassesPanel centerId={ownedCenterId} classes={classes} members={members} assignmentsByTeacher={assignmentsByTeacher} matchedIds={matchedIds} notify={notify}
+        extraActions={<AutoMatchButton centerId={ownedCenterId} classes={classes} members={members} assignmentsByTeacher={assignmentsByTeacher} matchedIds={matchedIds} notify={notify} />} />
+
+      <CenterOverview members={members} assignList={assignList} classes={classes} />
 
       {members.length === 0 && (
         <p className="rounded-2xl border p-4 text-center text-xs" style={{ borderColor: BORDER, color: MUTED, backgroundColor: CARD }}>
@@ -3068,9 +3782,67 @@ function PendingInviteCard({ invite, onAccept, onDecline }) {
   );
 }
 
-function TeacherCenterCard({ centerId, user }) {
+function FreeSlotEditForm({ editing, setEditing, onSave, onDelete }) {
+  const [sVal, setSVal] = useState(minToHHMM(editing.s));
+  const [eVal, setEVal] = useState(minToHHMM(editing.e));
+  useEffect(() => { setSVal(minToHHMM(editing.s)); setEVal(minToHHMM(editing.e)); }, [editing.id]);
+  return (
+    <div className="mt-3 rounded-xl border p-3" style={{ borderColor: FREE_COLOR.border, backgroundColor: "#F4FBF6" }}>
+      <p className="mb-2 text-xs font-medium" style={{ color: INK }}>Giờ rảnh đã chia sẻ — {DAYS[editing.day].full}</p>
+      <div className="mb-3 grid grid-cols-2 gap-2">
+        <div>
+          <label className="mb-1 block text-[11px]" style={{ color: MUTED }}>Bắt đầu</label>
+          <input type="time" step="1800" value={sVal} onChange={(e) => setSVal(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        </div>
+        <div>
+          <label className="mb-1 block text-[11px]" style={{ color: MUTED }}>Kết thúc</label>
+          <input type="time" step="1800" value={eVal} onChange={(e) => setEVal(e.target.value)} className="w-full rounded-lg border px-2 py-1.5 text-sm" style={{ borderColor: BORDER, color: INK }} />
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <button onClick={() => onSave(editing, hhmmToMin(sVal), hhmmToMin(eVal))} className="rounded-full px-3 py-1.5 text-xs font-semibold text-white" style={{ backgroundColor: FREE_COLOR.border }}>Lưu</button>
+        <button onClick={() => onDelete(editing)} className="rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: DANGER }}>Bỏ chia sẻ</button>
+        <button onClick={() => setEditing(null)} className="rounded-full border px-3 py-1.5 text-xs font-medium hover:bg-[#FFF6FA]" style={{ borderColor: BORDER, color: "#8A6070" }}>Đóng</button>
+      </div>
+    </div>
+  );
+}
+
+function TeacherCenterCard({ centerId, user, busySlots, notify }) {
   const [center, setCenter] = useState(null);
   const [assignments, setAssignments] = useState({});
+  const [member, setMember] = useState(null);
+  const [showGrid, setShowGrid] = useState(true);
+  const [editingF, setEditingF] = useState(null);
+  const memberRef = db.collection("centers").doc(centerId).collection("members").doc(user.uid);
+  useEffect(() => memberRef.onSnapshot((snap) => setMember(snap.exists ? snap.data() : null), () => {}), [centerId, user.uid]);
+  const myBusy = useMemo(() => busyForCenter(busySlots || {}, todayKey()), [busySlots]);
+  const myFree = useMemo(() => clipFreeSlots((member && member.freeSlots) || {}, myBusy), [member, myBusy]);
+  const saveFree = (next) => memberRef.update({ freeSlots: clean(clipFreeSlots(next, myBusy)), updatedAt: firebase.firestore.FieldValue.serverTimestamp() })
+    .catch(() => notify("Không lưu được giờ rảnh, thử lại nhé.", "error"));
+
+  const handleCreateFree = useCallback((day, s, e) => {
+    const [cs, ce] = clampRange(roundToHalfHour(s), roundToHalfHour(e));
+    if (ce - cs < 30) return;
+    const pieces = complementIntervals((myBusy[day] || []), cs, ce).filter(([a, b]) => b - a >= 30);
+    if (!pieces.length) { notify("Khung này trùng giờ bận của bạn nên không chia sẻ được.", "error"); return; }
+    let next = myFree;
+    pieces.forEach(([a, b]) => { next = addFreeBlock(next, day, a, b); });
+    saveFree(next);
+    if (pieces.length > 1 || pieces[0][0] !== cs || pieces[0][1] !== ce) notify("Đã chia sẻ — phần trùng giờ bận được tự bỏ ra.", "success");
+  }, [myBusy, myFree]);
+
+  const handleSaveFree = (f, s, e) => {
+    const [cs, ce] = clampRange(roundToHalfHour(s), roundToHalfHour(e));
+    if (ce - cs < 30) { notify("Khung rảnh tối thiểu 30 phút.", "error"); return; }
+    const rest = { ...myFree, [f.day]: (myFree[f.day] || []).filter((x) => x.id !== f.id) };
+    saveFree(addFreeBlock(rest, f.day, cs, ce));
+    setEditingF(null);
+  };
+  const handleDeleteFree = (f) => {
+    saveFree({ ...myFree, [f.day]: (myFree[f.day] || []).filter((x) => x.id !== f.id) });
+    setEditingF(null);
+  };
 
   useEffect(() => {
     const unsub1 = db.collection("centers").doc(centerId).onSnapshot((snap) => setCenter(snap.exists ? { id: snap.id, ...snap.data() } : null));
@@ -3091,7 +3863,20 @@ function TeacherCenterCard({ centerId, user }) {
 
   return (
     <div className="rounded-2xl border p-4" style={{ borderColor: BORDER, backgroundColor: CARD }}>
-      <p className="mb-2 text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{center?.name || "Trung tâm"}</p>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-sm font-semibold" style={{ color: INK, fontFamily: "'Baloo 2', system-ui, sans-serif" }}>{center?.name || "Trung tâm"}</p>
+          <p className="text-xs" style={{ color: MUTED }}>Trình độ: {levelLabel(member && member.level)} · {formatDuration(totalSlotMinutes(myFree))} rảnh đã chia sẻ/tuần</p>
+        </div>
+        <button onClick={() => setShowGrid((v) => !v)} className="rounded-full border px-3 py-1.5 text-xs font-medium" style={{ borderColor: FREE_COLOR.border, color: FREE_COLOR.text, backgroundColor: "#F4FBF6" }}>{showGrid ? "Thu gọn lịch rảnh" : "Đánh dấu giờ rảnh"}</button>
+      </div>
+      {showGrid && (
+        <div className="mb-3">
+          <AssignmentGrid busySlots={myBusy} assignments={assignments} freeSlots={myFree} onCreateDraft={handleCreateFree} onSelectFree={(day, f) => setEditingF({ ...f, day })} draftColor={FREE_COLOR.border} busyLabel="Giờ bận của bạn (trung tâm chỉ thấy là bận)" />
+          {editingF && <FreeSlotEditForm editing={editingF} setEditing={setEditingF} onSave={handleSaveFree} onDelete={handleDeleteFree} />}
+          <p className="mt-2 text-[11px]" style={{ color: MUTED_LIGHT }}>Kéo chuột để chia sẻ giờ rảnh (ô xanh) · bấm vào ô xanh để sửa/bỏ chia sẻ · trung tâm chỉ xếp lớp vào ô xanh và không thấy nội dung giờ bận của bạn.</p>
+        </div>
+      )}
       {dayIdxWithClasses.length === 0 ? (
         <p className="text-xs" style={{ color: MUTED }}>Chưa có lớp nào được xếp cho bạn ở trung tâm này.</p>
       ) : (
@@ -3112,7 +3897,7 @@ function TeacherCenterCard({ centerId, user }) {
   );
 }
 
-function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCenterId, notify }) {
+function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCenterId, busySlots, notify }) {
   const needVerify = !!user.email && !user.emailVerified;
   const pendingInvites = usePendingInvites(needVerify ? null : (user.email || "").trim().toLowerCase());
   const resendVerify = () => user.sendEmailVerification()
@@ -3132,7 +3917,7 @@ function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCent
   const handleAccept = async (invite) => {
     try {
       await db.collection("centers").doc(invite.centerId).collection("members").doc(user.uid).set({
-        email: user.email || null, role: "teacher", status: "active",
+        email: user.email || null, role: "teacher", status: "active", level: invite.level || "all",
         joinedAt: firebase.firestore.FieldValue.serverTimestamp(), updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
       await db.collection("users").doc(user.uid).set({ centerIds: firebase.firestore.FieldValue.arrayUnion(invite.centerId) }, { merge: true });
@@ -3172,7 +3957,7 @@ function CenterView({ user, centerIds, setCenterIds, ownedCenterId, setOwnedCent
 
       {centerIds.length > 0 && (
         <div className="space-y-3">
-          {centerIds.map((cid) => <TeacherCenterCard key={cid} centerId={cid} user={user} />)}
+          {centerIds.map((cid) => <TeacherCenterCard key={cid} centerId={cid} user={user} busySlots={busySlots} notify={notify} />)}
         </div>
       )}
 
@@ -3659,7 +4444,7 @@ function AdminCenterCard({ c, onDeleted, notify }) {
   const deleteCenter = async () => {
     if (!window.confirm(`XOÁ trung tâm "${c.name}" (chủ: ${c.ownerEmail || c.ownerId})?\nToàn bộ giáo viên, lời mời và lịch phân lớp của trung tâm sẽ bị xoá. Không thể hoàn tác.`)) return;
     try {
-      for (const sub of ["members", "invites", "assignments"]) {
+      for (const sub of ["members", "invites", "assignments", "classes"]) {
         const s = await ref.collection(sub).get();
         await Promise.all(s.docs.map((d) => d.ref.delete()));
       }
@@ -4220,10 +5005,14 @@ function App() {
         const cref = db.collection("centers").doc(cid);
         Promise.all([cref.get(), cref.collection("members").doc(user.uid).get()]).then(([c, m]) => {
           if (!c.exists || !m.exists) return; // trung tâm đã xoá hoặc đã bị gỡ khỏi trung tâm
-          return cref.collection("members").doc(user.uid).set({
-          busySlots: clean(busySlots), email: user.email || null, role: "teacher", status: "active",
-          updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
+          const safeBusy = busyForCenter(busySlots, todayKey());
+          const data = m.data() || {};
+          // update() thay cả trường → ghi chú/thẻ cũ bị xoá hẳn khỏi bản của trung tâm
+          return cref.collection("members").doc(user.uid).update({
+            busySlots: clean(safeBusy), freeSlots: clean(clipFreeSlots(data.freeSlots || {}, safeBusy)),
+            email: user.email || null, role: "teacher", status: "active",
+            updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
         }).catch(() => {});
       });
     }, 600);
@@ -4324,7 +5113,7 @@ function App() {
       <main className="relative z-10 mx-auto max-w-5xl px-5 py-6">
         <CareBanner key={user.uid} user={user} busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} />
         {view === "dashboard" && <DashboardView busySlots={busySlots} busyOnce={busyOnce} tasks={tasks} onDropTask={handleDropTask} user={user} />}
-        {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} tasks={tasks} setTags={setTags} notify={notify} />}
+        {view === "slots" && <SlotEditorView busySlots={busySlots} setBusySlots={setBusySlots} busyOnce={busyOnce} setBusyOnce={setBusyOnce} tasks={tasks} setTags={setTags} notify={notify} user={user} centerIds={centerIds} />}
         {view === "center" && (
           <CenterView
             user={user}
@@ -4332,6 +5121,7 @@ function App() {
             setCenterIds={setCenterIds}
             ownedCenterId={ownedCenterId}
             setOwnedCenterId={setOwnedCenterId}
+            busySlots={busySlots}
             notify={notify}
           />
         )}
